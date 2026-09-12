@@ -1,0 +1,205 @@
+global:
+  environment:
+    enabled: true
+    profiles:
+      - generic-linux
+      - containerd
+
+  alertRules:
+    predefinedWorkloads:
+      tetragon:
+        namespaces:
+          - kube-system
+        podLabels:
+          - "app.kubernetes.io/part-of=tetragon"
+          - "app.kubernetes.io/name=tetragon"
+          - "app.kubernetes.io/name=tetragon-operator"
+      cilium:
+        namespaces:
+          - kube-system
+        podLabels:
+          - "app.kubernetes.io/part-of=cilium"
+          - "app.kubernetes.io/name=cilium-agent"
+          - "app.kubernetes.io/name=cilium-envoy"
+          - "app.kubernetes.io/name=cilium-operator"
+          - "k8s-app=cilium"
+          - "k8s-app=cilium-envoy"
+          - "io.cilium/app=operator"
+          - "name=cilium-operator"
+    alertCelExprs: []
+
+rules:
+  exec:
+    all:
+      interactiveShellExec:
+        enabled: false
+      interactiveShellExit:
+        enabled: false
+      interactiveShellFollowup:
+        enabled: false
+
+  path:
+    all:
+      directoryTraversal:
+        enabled: false
+      clearLogAttempts:
+        enabled: false
+
+  os:
+    all:
+      mount:
+        enabled: true
+        trusted:
+          processes:
+            - binaries:
+                postFix: true
+                paths:
+                  - "/usr/bin/kubelet"
+                  - "/usr/local/bin/kubelet"
+                  - "/usr/bin/containerd"
+                  - "/usr/bin/containerd-shim-runc-v2"
+                  - "/usr/sbin/runc"
+                  - "/usr/bin/runc"
+                  - "/usr/local/sbin/runc"
+                  - "/usr/local/bin/runc"
+                  - "/usr/lib/systemd/systemd"
+                  - "/lib/systemd/systemd"
+                  - "/usr/bin/systemd-tmpfiles"
+                  - "/usr/bin/tetragon"
+                  - "/var/lib/tetragon/tetragon-fs-scanner"
+                  - "kubelet"
+                  - "containerd"
+                  - "containerd-shim-runc-v2"
+                  - "runc"
+                  - "systemd"
+                  - "systemd-tmpfiles"
+                  - "tetragon"
+                  - "tetragon-fs-scanner"
+          alertCelExprs: []
+
+      ptrace:
+        enabled: true
+        trusted:
+          processes:
+            - binaries:
+                postFix: true
+                paths:
+                  - "/usr/lib/systemd/systemd"
+                  - "/lib/systemd/systemd"
+                  - "/usr/lib/systemd/systemd-journald"
+                  - "/usr/bin/systemctl"
+                  - "/usr/bin/systemd-tmpfiles"
+                  - "/usr/lib/systemd/systemd-user-runtime-dir"
+                  - "/usr/lib/systemd/systemd-udevd"
+                  - "/usr/bin/kubelet"
+                  - "/usr/local/bin/kubelet"
+                  - "/usr/bin/containerd"
+                  - "/usr/bin/containerd-shim-runc-v2"
+                  - "/usr/sbin/runc"
+                  - "/usr/bin/runc"
+                  - "/usr/local/sbin/runc"
+                  - "/usr/local/bin/runc"
+                  - "/usr/bin/tetragon"
+                  - "/var/lib/tetragon/tetragon-fs-scanner"
+                  - "/usr/bin/ps"
+                  - "/bin/ps"
+                  - "systemd"
+                  - "systemd-journald"
+                  - "systemctl"
+                  - "systemd-tmpfiles"
+                  - "systemd-user-runtime-dir"
+                  - "systemd-udevd"
+                  - "kubelet"
+                  - "containerd"
+                  - "containerd-shim-runc-v2"
+                  - "runc"
+                  - "tetragon"
+                  - "tetragon-fs-scanner"
+                  - "ps"
+          alertCelExprs:
+            - |
+              (
+                has(ev.process.pod) &&
+                ev.process.pod.namespace == "kube-system" &&
+                has(ev.process.pod.workload) &&
+                (ev.process.pod.workload == "tetragon" || ev.process.pod.workload == "cilium")
+              )
+              ||
+              (
+                !has(ev.process.pod) &&
+                (ev.process.binary in ["/usr/bin/ps", "/bin/ps", "ps"])
+              )
+
+      bpf:
+        enabled: true
+        trusted:
+          processes:
+            - binaries:
+                postFix: true
+                paths:
+                  - "/usr/bin/kubelet"
+                  - "/usr/local/bin/kubelet"
+                  - "/usr/bin/containerd"
+                  - "/usr/bin/containerd-shim-runc-v2"
+                  - "/usr/sbin/runc"
+                  - "/usr/bin/runc"
+                  - "/usr/local/sbin/runc"
+                  - "/usr/local/bin/runc"
+                  - "/usr/bin/tetragon"
+                  - "/usr/bin/tetra"
+                  - "/var/lib/tetragon/tetragon-runner"
+                  - "tetragon"
+                  - "tetra"
+                  - "tetragon-runner"
+                  - "/usr/bin/cilium-agent"
+                  - "/usr/bin/cilium-envoy"
+                  - "/usr/bin/cilium-operator"
+                  - "/opt/cni/bin/cilium-cni"
+                  - "cilium-agent"
+                  - "cilium-envoy"
+                  - "cilium-operator"
+                  - "cilium-cni"
+                  - "/usr/local/bin/bpftool"
+                  - "/usr/bin/bpftool"
+                  - "/usr/sbin/bpftool"
+                  - "bpftool"
+          alertCelExprs: []
+
+  privilege:
+    all:
+      capabilities:
+        enabled: true
+        trusted:
+          processes:
+            - binaries:
+                postFix: true
+                paths:
+                  - "/usr/bin/kubelet"
+                  - "/usr/local/bin/kubelet"
+                  - "/usr/bin/containerd"
+                  - "/usr/bin/containerd-shim-runc-v2"
+                  - "/usr/sbin/runc"
+                  - "/usr/bin/runc"
+                  - "/usr/local/sbin/runc"
+                  - "/usr/local/bin/runc"
+          alertCelExprs: []
+
+      id:
+        enabled: true
+        trusted:
+          processes:
+            - binaries:
+                postFix: true
+                paths:
+                  - "/usr/bin/kubelet"
+                  - "/usr/local/bin/kubelet"
+                  - "/usr/bin/containerd"
+                  - "/usr/bin/containerd-shim-runc-v2"
+                  - "/usr/sbin/runc"
+                  - "/usr/bin/runc"
+                  - "/usr/local/sbin/runc"
+                  - "/usr/local/bin/runc"
+          alertCelExprs: []
+
+      exec:
+        enabled: false

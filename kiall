@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${KUP_CONFIG:-${SCRIPT_DIR}/kup.conf}"
+
+[[ -f "${CONFIG_FILE}" ]] || die "private config not found: ${CONFIG_FILE}"
+chmod 600 "${CONFIG_FILE}"
+
+set -a
+# shellcheck disable=SC1090
+source "${CONFIG_FILE}"
+set +a
+
+WORKDIR="${KUP_WORKDIR:-${SCRIPT_DIR}}"
+KUBECONFIG_FILE="${KUBECONFIG_FILE:-${WORKDIR}/kubeconfig}"
+
+secure_private_kubeconfig() {
+  if [[ -f "${KUBECONFIG_FILE}" ]]; then
+    chmod 600 "${KUBECONFIG_FILE}"
+  fi
+}
+
+trap secure_private_kubeconfig EXIT
+
+need terraform
+need python3
+: "${ALICLOUD_ACCESS_KEY:?ALICLOUD_ACCESS_KEY is required in the private kup.conf}"
+: "${ALICLOUD_SECRET_KEY:?ALICLOUD_SECRET_KEY is required in the private kup.conf}"
+[[ -f "${WORKDIR}/main.tf" ]] || die "Terraform configuration not found: ${WORKDIR}/main.tf"
+[[ "${KUBECONFIG_FILE}" == "${WORKDIR}/"* ]] || die "KUBECONFIG_FILE must remain inside KUP_WORKDIR"
+
+export ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY
+export ALICLOUD_REGION="${ALIBABA_CLOUD_REGION:?ALIBABA_CLOUD_REGION is required}"
+export TF_IN_AUTOMATION=1
+export TF_INPUT=0
+
+export TF_VAR_region="${ALIBABA_CLOUD_REGION}"
+export TF_VAR_name_prefix="${ACK_NAME_PREFIX:?}"
+export TF_VAR_vpc_cidr="${ACK_VPC_CIDR:?}"
+export TF_VAR_vsw_cidr="${ACK_VSW_CIDR:?}"
+export TF_VAR_pod_cidr="${ACK_POD_CIDR:?}"
+export TF_VAR_service_cidr="${ACK_SERVICE_CIDR:?}"
+export TF_VAR_node_cidr_mask="${ACK_NODE_CIDR_MASK:?}"
+export TF_VAR_cluster_spec="${ACK_CLUSTER_SPEC:?}"
+export TF_VAR_enable_nat_gateway="${ACK_ENABLE_NAT_GATEWAY:?}"
+export TF_VAR_enable_public_apiserver="${ACK_ENABLE_PUBLIC_APISERVER:?}"
+export TF_VAR_node_pool_desired_size="${ACK_NODE_COUNT:?}"
+export TF_VAR_instance_type="${ACK_INSTANCE_TYPE:?}"
+export TF_VAR_system_disk_category="${ACK_SYSTEM_DISK_CATEGORY:?}"
+export TF_VAR_system_disk_size="${ACK_SYSTEM_DISK_SIZE:?}"
+export TF_VAR_node_password="${ACK_NODE_PASSWORD:?ACK_NODE_PASSWORD is required}"
+export TF_VAR_zone_id="${ACK_ZONE_ID:-}"
+
+cd "${WORKDIR}"
+secure_private_kubeconfig
+
+redact_secrets() {
+  python3 -c '
+import os, sys
+values = [
+    os.environ.get(name, "")
+    for name in ("ALICLOUD_ACCESS_KEY", "ALICLOUD_SECRET_KEY", "ACK_NODE_PASSWORD")
+]
+for line in sys.stdin:
+    for value in values:
+        if value:
+            line = line.replace(value, "<redacted>")
+    sys.stdout.write(line)
+    sys.stdout.flush()
+'
+}
+
+run_terraform() {
+  terraform "$@" 2>&1 | redact_secrets
+}
+
+terraform_destroy() {
+  local attempt
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    if run_terraform destroy -auto-approve -input=false; then
+      return 0
+    fi
+    if (( attempt == 3 )); then
+      return 1
+    fi
+    log "Terraform destroy attempt ${attempt} failed; retry in 15 seconds"
+    sleep 15
+  done
+}
+
+log "initialize Terraform"
+run_terraform init -input=false
+
+log "destroy every resource owned by this Terraform state"
+terraform_destroy
+
+remaining_state="$(terraform state list)"
+if [[ -n "${remaining_state}" ]]; then
+  printf '%s\n' "${remaining_state}" >&2
+  die "Terraform destroy returned success but state is not empty; preserving kubeconfig and state"
+fi
+
+if [[ -f "${KUBECONFIG_FILE}" ]]; then
+  rm -f -- "${KUBECONFIG_FILE}"
+  log "removed project-private kubeconfig"
+fi
+
+log "SUCCESS: Terraform state is empty; no out-of-state resources were touched"

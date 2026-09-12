@@ -1,0 +1,84 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: demo-l7-visibility-no-block
+  namespace: demo
+spec:
+  description: "Enable L7 visibility (HTTP/gRPC + DNS) without blocking any traffic"
+  endpointSelector: {}
+
+  ingress:
+  # 1) Allow all ingress traffic (no blocking, now or in the future)
+  - fromEntities:
+    - all
+
+  # 2) Enable L7 visibility for selected inbound ports (HTTP/gRPC)
+  - fromEntities:
+    - all
+    toPorts:
+    - ports:
+      - port: "80"
+        protocol: TCP
+      - port: "8080"
+        protocol: TCP
+      - port: "3550"
+        protocol: TCP
+      - port: "5050"
+        protocol: TCP
+      - port: "7070"
+        protocol: TCP
+      - port: "7000"
+        protocol: TCP
+      - port: "9555"
+        protocol: TCP
+      - port: "5000"
+        protocol: TCP
+      - port: "50051"
+        protocol: TCP
+      rules:
+        http:
+        - {}
+
+  egress:
+  # 1) Allow all egress traffic (no blocking, now or in the future)
+  - toEntities:
+    - all
+
+  # 2) Enable DNS visibility (allow all DNS)
+  - toEntities:
+    - all
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*"
+
+  # 3) Enable L7 visibility for selected outbound ports (HTTP/gRPC)
+  - toEntities:
+    - all
+    toPorts:
+    - ports:
+      - port: "80"
+        protocol: TCP
+      - port: "8080"
+        protocol: TCP
+      - port: "3550"
+        protocol: TCP
+      - port: "5050"
+        protocol: TCP
+      - port: "7070"
+        protocol: TCP
+      - port: "7000"
+        protocol: TCP
+      - port: "9555"
+        protocol: TCP
+      - port: "5000"
+        protocol: TCP
+      - port: "50051"
+        protocol: TCP
+      rules:
+        http:
+        - {}
+

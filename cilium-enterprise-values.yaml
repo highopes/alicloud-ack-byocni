@@ -1,0 +1,81 @@
+securityContext:
+  privileged: true
+
+cluster:
+  id: ${CILIUM_CLUSTER_ID}
+  name: ${CILIUM_CLUSTER_NAME}
+
+k8s-require-ipv4-pod-cidr: true
+
+ipam:
+  mode: kubernetes
+
+routingMode: native
+ipv4NativeRoutingCIDR: "${ACK_POD_CIDR}"
+
+nodePort:
+  enabled: true
+
+kubeProxyReplacement: "true"
+
+bpf:
+  masquerade: true
+
+ipMasqAgent:
+  enabled: true
+  config:
+    nonMasqueradeCIDRs:
+      - "${ACK_POD_CIDR}"
+      - "${ACK_VPC_CIDR}"
+
+hubble:
+  enabled: true
+
+  export:
+    static:
+      enabled: true
+      filePath: "/var/run/cilium/hubble/hubble.log"
+
+  relay:
+    enabled: true
+
+  ui:
+    enabled: false
+
+  tls:
+    enabled: true
+    auto:
+      enabled: true
+
+  metrics:
+    enableOpenMetrics: true
+    enabled:
+      - dns
+      - drop
+      - tcp
+      - icmp
+      - flow:sourceContext=workload-name|reserved-identity;destinationContext=workload-name|reserved-identity
+      - kafka:labelsContext=source_namespace,source_workload,destination_namespace,destination_workload,traffic_direction;sourceContext=workload-name|reserved-identity;destinationContext=workload-name|reserved-identity
+      - httpV2:labelsContext=source_ip,source_namespace,source_workload,destination_ip,destination_namespace,destination_workload,traffic_direction;sourceContext=workload-name|reserved-identity;destinationContext=workload-name|reserved-identity
+
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+
+operator:
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+
+envoy:
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+
+enterprise:
+  featureGate:
+    approved:
+      - HubbleTimescape

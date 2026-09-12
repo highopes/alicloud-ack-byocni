@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${KUP_CONFIG:-${SCRIPT_DIR}/kup.conf}"
+
+[[ -f "${CONFIG_FILE}" ]] || die "private config not found: ${CONFIG_FILE}; copy kup.conf.example to kup.conf first"
+chmod 600 "${CONFIG_FILE}"
+
+set -a
+# shellcheck disable=SC1090
+source "${CONFIG_FILE}"
+set +a
+
+WORKDIR="${KUP_WORKDIR:-${SCRIPT_DIR}}"
+KUBECONFIG_FILE="${KUBECONFIG_FILE:-${WORKDIR}/kubeconfig}"
+RUNTIME_DIR="${RUNTIME_DIR:-${WORKDIR}/runtime}"
+ACK_CONTEXT="${ACK_CONTEXT:-ack-byocni-demo}"
+ACK_API_TIMEOUT="${ACK_API_TIMEOUT:-10s}"
+CILIUM_ROLLOUT_TIMEOUT="${CILIUM_ROLLOUT_TIMEOUT:-20m}"
+TETRAGON_ROLLOUT_TIMEOUT="${TETRAGON_ROLLOUT_TIMEOUT:-15m}"
+HELM_ROLLOUT_TIMEOUT="${HELM_ROLLOUT_TIMEOUT:-20m}"
+NODE_DISCOVERY_TIMEOUT_SEC="${NODE_DISCOVERY_TIMEOUT_SEC:-2400}"
+TETRAGON_EXPORT_DENYLIST="${TETRAGON_EXPORT_DENYLIST:-}"
+
+require_var() {
+  local name="$1"
+  local value="${!name:-}"
+  [[ -n "${value}" ]] || die "required setting is empty: ${name}"
+  case "${value}" in
+    ReplaceMe|REPLACE_ME|replace-me|CONTACT.*) die "replace placeholder value for ${name} in the private kup.conf" ;;
+  esac
+}
+
+require_bool() {
+  local name="$1"
+  local value="${!name:-}"
+  case "${value}" in
+    true|false) ;;
+    *) die "${name} must be true or false" ;;
+  esac
+}
+
+for command_name in terraform kubectl helm python3 curl awk sed base64; do
+  need "${command_name}"
+done
+
+for setting_name in \
+  ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY ACK_NODE_PASSWORD ISO_REPO_URL \
+  ALIBABA_CLOUD_REGION ACK_NAME_PREFIX ACK_CLUSTER_SPEC ACK_VPC_CIDR ACK_VSW_CIDR \
+  ACK_POD_CIDR ACK_SERVICE_CIDR ACK_NODE_CIDR_MASK ACK_INSTANCE_TYPE ACK_NODE_COUNT \
+  ACK_SYSTEM_DISK_CATEGORY ACK_SYSTEM_DISK_SIZE ACK_ENABLE_NAT_GATEWAY \
+  ACK_ENABLE_PUBLIC_APISERVER CILIUM_CLUSTER_NAME CILIUM_CLUSTER_ID \
+  CILIUM_CHART_VER TETRAGON_CHART_VER TPR_CHART_VER HUBBLE_UI_CHART_VER \
+  HUBBLE_TIMESCAPE_CHART_VER HUBBLE_ENTERPRISE_CHART_VER DEMO_NAMESPACE TEST_NAMESPACE \
+  HUBBLE_UI_LOCAL_PORT TETRAGON_EXPORT_DIRECTORY TETRAGON_EXPORT_FILENAME \
+  TETRAGON_ALERT_EXPORT_DIRECTORY TETRAGON_EXPORT_ALLOWLIST TETRAGON_CGROUP_RATE; do
+  require_var "${setting_name}"
+done
+require_bool ACK_ENABLE_NAT_GATEWAY
+require_bool ACK_ENABLE_PUBLIC_APISERVER
+
+[[ -f "${WORKDIR}/main.tf" ]] || die "Terraform configuration not found in KUP_WORKDIR: ${WORKDIR}/main.tf"
+[[ "${KUBECONFIG_FILE}" == "${WORKDIR}/"* ]] || die "KUBECONFIG_FILE must remain inside KUP_WORKDIR"
+[[ "${RUNTIME_DIR}" == "${WORKDIR}/"* ]] || die "RUNTIME_DIR must remain inside KUP_WORKDIR"
+
+for required_file in \
+  cilium-enterprise-values.yaml hubble-enterprise-values.yaml hubble-timescape-values.yaml \
+  hubble-ui-values.yaml tetragon.yaml tpr-values.yaml ns_test/testcurl.yaml \
+  ns_demo/mini-boutique-lite.yaml ns_demo/cnp-l7-visibility.yaml; do
+  [[ -f "${SCRIPT_DIR}/${required_file}" ]] || die "required file not found: ${SCRIPT_DIR}/${required_file}"
+done
+
+python3 - "${ACK_VPC_CIDR}" "${ACK_VSW_CIDR}" "${ACK_POD_CIDR}" "${ACK_SERVICE_CIDR}" <<'PY'
+import ipaddress
+import sys
+
+vpc, vsw, pod, service = [ipaddress.ip_network(value, strict=True) for value in sys.argv[1:]]
+if not vsw.subnet_of(vpc):
+    raise SystemExit(f"vSwitch CIDR {vsw} must be inside VPC CIDR {vpc}")
+for left_name, left, right_name, right in (
+    ("VPC", vpc, "Pod", pod),
+    ("VPC", vpc, "Service", service),
+    ("Pod", pod, "Service", service),
+):
+    if left.overlaps(right):
+        raise SystemExit(f"{left_name} CIDR {left} overlaps {right_name} CIDR {right}")
+PY
+
+mkdir -p "${RUNTIME_DIR}"
+cd "${WORKDIR}"
+
+export ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY
+export ALICLOUD_REGION="${ALIBABA_CLOUD_REGION}"
+export TF_IN_AUTOMATION=1
+export TF_INPUT=0
+
+export TF_VAR_region="${ALIBABA_CLOUD_REGION}"
+export TF_VAR_name_prefix="${ACK_NAME_PREFIX}"
+export TF_VAR_vpc_cidr="${ACK_VPC_CIDR}"
+export TF_VAR_vsw_cidr="${ACK_VSW_CIDR}"
+export TF_VAR_pod_cidr="${ACK_POD_CIDR}"
+export TF_VAR_service_cidr="${ACK_SERVICE_CIDR}"
+export TF_VAR_node_cidr_mask="${ACK_NODE_CIDR_MASK}"
+export TF_VAR_cluster_spec="${ACK_CLUSTER_SPEC}"
+export TF_VAR_enable_nat_gateway="${ACK_ENABLE_NAT_GATEWAY}"
+export TF_VAR_enable_public_apiserver="${ACK_ENABLE_PUBLIC_APISERVER}"
+export TF_VAR_node_pool_desired_size="${ACK_NODE_COUNT}"
+export TF_VAR_instance_type="${ACK_INSTANCE_TYPE}"
+export TF_VAR_system_disk_category="${ACK_SYSTEM_DISK_CATEGORY}"
+export TF_VAR_system_disk_size="${ACK_SYSTEM_DISK_SIZE}"
+export TF_VAR_node_password="${ACK_NODE_PASSWORD}"
+export TF_VAR_zone_id="${ACK_ZONE_ID:-}"
+
+kctl() {
+  kubectl \
+    --kubeconfig "${KUBECONFIG_FILE}" \
+    --context "${ACK_CONTEXT}" \
+    "$@"
+}
+
+hctl() {
+  helm \
+    --kubeconfig "${KUBECONFIG_FILE}" \
+    --kube-context "${ACK_CONTEXT}" \
+    "$@"
+}
+
+recover_pending_helm_revision() {
+  local release="$1"
+  local namespace="$2"
+  local history_json pending_revision
+
+  history_json="$(hctl history "${release}" --namespace "${namespace}" -o json 2>/dev/null || true)"
+  [[ -n "${history_json}" ]] || return 0
+  pending_revision="$(printf '%s' "${history_json}" | python3 -c '
+import json, sys
+try:
+    history = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+if not history:
+    raise SystemExit(0)
+latest = history[-1]
+if str(latest.get("status", "")).startswith("pending-"):
+    print(latest.get("revision", ""))
+')"
+
+  if [[ -n "${pending_revision}" ]]; then
+    log "remove interrupted Helm ${release} pending revision ${pending_revision} before retry"
+    kctl -n "${namespace}" delete secret \
+      "sh.helm.release.v1.${release}.v${pending_revision}" \
+      --ignore-not-found >/dev/null
+  fi
+}
+
+helm_release_is_deployed() {
+  local release="$1"
+  local namespace="$2"
+  hctl status "${release}" --namespace "${namespace}" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    status = json.load(sys.stdin).get("info", {}).get("status")
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if status == "deployed" else 1)
+'
+}
+
+helm_upgrade() {
+  local release="$1"
+  local namespace="kube-system"
+  local attempt
+
+  recover_pending_helm_revision "${release}" "${namespace}"
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    if hctl upgrade --install "$@"; then
+      if helm_release_is_deployed "${release}" "${namespace}"; then
+        return 0
+      fi
+      log "Helm command returned success but ${namespace}/${release} is not deployed"
+    fi
+    if [[ "${attempt}" -lt 3 ]]; then
+      recover_pending_helm_revision "${release}" "${namespace}"
+      log "Helm convergence failed (attempt ${attempt}/3); retrying after 15 seconds"
+      sleep 15
+    fi
+  done
+  return 1
+}
+
+redact_secrets() {
+  python3 -c '
+import os, sys
+values = [
+    os.environ.get(name, "")
+    for name in ("ALICLOUD_ACCESS_KEY", "ALICLOUD_SECRET_KEY", "ACK_NODE_PASSWORD", "ISO_REPO_URL")
+]
+for line in sys.stdin:
+    for value in values:
+        if value:
+            line = line.replace(value, "<redacted>")
+    sys.stdout.write(line)
+    sys.stdout.flush()
+'
+}
+
+run_terraform() {
+  terraform "$@" 2>&1 | redact_secrets
+}
+
+terraform_apply() {
+  local attempt
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    if run_terraform apply -auto-approve -input=false; then
+      return 0
+    fi
+    if (( attempt == 3 )); then
+      return 1
+    fi
+    log "Terraform apply attempt ${attempt} failed; retry in 15 seconds"
+    sleep 15
+  done
+}
+
+render_template() {
+  local input_file="$1"
+  local output_file="$2"
+  python3 - "${input_file}" "${output_file}" <<'PY'
+import os
+import sys
+from string import Template
+
+source, destination = sys.argv[1:]
+with open(source, "r", encoding="utf-8") as handle:
+    rendered = Template(handle.read()).substitute(os.environ)
+with open(destination, "w", encoding="utf-8") as handle:
+    handle.write(rendered)
+PY
+}
+
+normalize_context() {
+  local original_context
+  original_context="$(kubectl --kubeconfig "${KUBECONFIG_FILE}" config current-context)"
+  [[ -n "${original_context}" ]] || die "generated kubeconfig has no current context"
+
+  if [[ "${original_context}" != "${ACK_CONTEXT}" ]]; then
+    if kubectl --kubeconfig "${KUBECONFIG_FILE}" config get-contexts -o name | awk -v wanted="${ACK_CONTEXT}" '$0 == wanted { found=1 } END { exit(found ? 0 : 1) }'; then
+      kubectl --kubeconfig "${KUBECONFIG_FILE}" config delete-context "${ACK_CONTEXT}" >/dev/null
+    fi
+    kubectl --kubeconfig "${KUBECONFIG_FILE}" config rename-context "${original_context}" "${ACK_CONTEXT}" >/dev/null
+  fi
+  kubectl --kubeconfig "${KUBECONFIG_FILE}" config use-context "${ACK_CONTEXT}" >/dev/null
+}
+
+wait_for_api() {
+  local attempt
+  for ((attempt = 1; attempt <= 120; attempt++)); do
+    if kctl --request-timeout="${ACK_API_TIMEOUT}" get --raw=/readyz >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+  die "ACK API server did not become reachable"
+}
+
+wait_for_nodes_and_podcidrs() {
+  local deadline now summary count assigned
+  deadline=$(( $(date +%s) + NODE_DISCOVERY_TIMEOUT_SEC ))
+  while :; do
+    summary="$(kctl get nodes -o json 2>/dev/null | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items", [])
+print(len(items), sum(bool(item.get("spec", {}).get("podCIDR")) for item in items))
+' 2>/dev/null || true)"
+    count="${summary%% *}"
+    assigned="${summary##* }"
+    if [[ "${count:-0}" -ge "${ACK_NODE_COUNT}" && "${assigned:-0}" -eq "${count:-0}" ]]; then
+      log "ACK workers discovered: ${count}; PodCIDR assigned: ${assigned}"
+      return 0
+    fi
+    now="$(date +%s)"
+    if [[ "${now}" -ge "${deadline}" ]]; then
+      kctl get nodes -o wide || true
+      die "timed out waiting for ${ACK_NODE_COUNT} workers with PodCIDR assignments"
+    fi
+    sleep 10
+  done
+}
+
+wait_for_cilium_health() {
+  local attempt
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    if kctl -n kube-system exec daemonset/cilium -c cilium-agent -- cilium-dbg status --brief >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 10
+  done
+  kctl -n kube-system exec daemonset/cilium -c cilium-agent -- cilium-dbg status || true
+  die "Cilium agent status did not become healthy"
+}
+
+restart_cilium_if_flow_export_missing() {
+  local attempt
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    if kctl -n kube-system exec daemonset/cilium -c cilium-agent -- \
+      sh -c 'test -s /var/run/cilium/hubble/hubble.log' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+
+  log "Cilium flow export is configured but not active; perform a one-time DaemonSet rollout"
+  kctl -n kube-system rollout restart daemonset/cilium
+}
+
+wait_for_hubble_flow_export() {
+  local attempt pods pod missing
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    pods="$(kctl -n kube-system get pod -l k8s-app=cilium \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+    missing=0
+    while IFS= read -r pod; do
+      [[ -n "${pod}" ]] || continue
+      if ! kctl -n kube-system exec "${pod}" -c cilium-agent -- \
+        sh -c 'test -s /var/run/cilium/hubble/hubble.log' >/dev/null 2>&1; then
+        missing=1
+      fi
+    done <<< "${pods}"
+    if [[ -n "${pods}" && "${missing}" -eq 0 ]]; then
+      log "Hubble static flow export is non-empty on every Cilium node"
+      return 0
+    fi
+    sleep 5
+  done
+  die "Hubble flow export did not become non-empty on every Cilium node"
+}
+
+validate_chart() {
+  local release="$1"
+  local chart="$2"
+  local version="$3"
+  local values_file="$4"
+  local safe_name="${release//[^A-Za-z0-9_.-]/-}"
+
+  log "validate Helm chart ${chart} ${version}"
+  helm show chart "${chart}" --version "${version}" > "${RUNTIME_DIR}/${safe_name}-chart.yaml"
+  helm show values "${chart}" --version "${version}" > "${RUNTIME_DIR}/${safe_name}-default-values.yaml"
+  helm template "${release}" "${chart}" \
+    --version "${version}" \
+    --namespace kube-system \
+    -f "${values_file}" > "${RUNTIME_DIR}/${safe_name}-rendered.yaml"
+}
+
+ensure_namespace() {
+  local namespace="$1"
+  if ! kctl get namespace "${namespace}" >/dev/null 2>&1; then
+    kctl create namespace "${namespace}" >/dev/null
+  fi
+}
+
+validate_application_networking() {
+  local pods source_pod target_ip pod
+  pods="$(kctl -n "${TEST_NAMESPACE}" get pod -l app=testcurl -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}')"
+  source_pod="$(printf '%s\n' "${pods}" | awk 'NF >= 2 {print $1; exit}')"
+  target_ip="$(printf '%s\n' "${pods}" | awk 'NF >= 2 {print $2}' | sed -n '2p')"
+  [[ -n "${source_pod}" ]] || die "no testcurl pod is available for network validation"
+  [[ -n "${target_ip}" ]] || target_ip="$(printf '%s\n' "${pods}" | awk 'NF >= 2 {print $2; exit}')"
+
+  log "validate DNS, pod-to-pod, pod-to-service, and external HTTPS"
+  kctl -n "${TEST_NAMESPACE}" exec "${source_pod}" -- nslookup kubernetes.default.svc.cluster.local >/dev/null
+  kctl -n "${TEST_NAMESPACE}" exec "${source_pod}" -- ping -c 2 -W 5 "${target_ip}" >/dev/null
+  kctl -n "${TEST_NAMESPACE}" exec "${source_pod}" -- curl -fsS --max-time 20 \
+    "http://frontend.${DEMO_NAMESPACE}.svc.cluster.local/" >/dev/null
+  kctl -n "${TEST_NAMESPACE}" exec "${source_pod}" -- curl -fsSI --max-time 30 \
+    https://www.cisco.com/ >/dev/null
+
+  while IFS= read -r pod; do
+    [[ -n "${pod}" ]] || continue
+    kctl -n "${TEST_NAMESPACE}" exec "${pod}" -- curl -fsS --max-time 20 \
+      "http://frontend.${DEMO_NAMESPACE}.svc.cluster.local/" >/dev/null
+  done < <(printf '%s\n' "${pods}" | awk 'NF >= 2 {print $1}')
+}
+
+validate_tetragon_runtime() {
+  local pods pod policy_count alert_count tetragon_logs
+  pods="$(kctl -n kube-system get pod \
+    -l app.kubernetes.io/component=agent,app.kubernetes.io/name=tetragon \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+  [[ -n "${pods}" ]] || die "no Tetragon agent pods found"
+
+  while IFS= read -r pod; do
+    [[ -n "${pod}" ]] || continue
+    tetragon_logs="$(kctl -n kube-system logs "${pod}" -c tetragon --tail=20000)"
+    if ! grep -F 'HaveProgramType(ebpf.LSM) = true' <<< "${tetragon_logs}" >/dev/null; then
+      die "Tetragon did not confirm eBPF LSM program support in pod ${pod}"
+    fi
+    kctl -n kube-system exec "${pod}" -c tetragon -- \
+      sh -c 'test -s /var/run/cilium/hubble/tetragon.log' \
+      || die "Tetragon network event export is empty in pod ${pod}"
+    kctl -n kube-system exec "${pod}" -c tetragon -- sh -c '
+      for file in /var/run/cilium/hubble/alert/*; do
+        if [ -s "$file" ]; then
+          exit 0
+        fi
+      done
+      exit 1
+    ' || die "Tetragon alert export is empty in pod ${pod}"
+  done < <(printf '%s\n' "${pods}")
+
+  policy_count="$(kctl get tracingpolicies -o name 2>/dev/null | awk 'END {print NR+0}')"
+  alert_count="$(kctl get alertrules -o name 2>/dev/null | awk 'END {print NR+0}')"
+  [[ "${policy_count}" -gt 0 ]] || die "no Tetragon TracingPolicy objects are loaded"
+  [[ "${alert_count}" -gt 0 ]] || die "no Tetragon AlertRule objects are loaded"
+  log "Tetragon policies loaded: tracingpolicies=${policy_count}, alertrules=${alert_count}"
+}
+
+validate_service_endpoint() {
+  local namespace="$1"
+  local service="$2"
+  local endpoint attempt
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    endpoint="$(kctl -n "${namespace}" get endpoints "${service}" \
+      -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)"
+    if [[ -n "${endpoint}" ]]; then
+      return 0
+    fi
+    sleep 5
+  done
+  kctl -n "${namespace}" describe service "${service}" || true
+  die "service did not get a ready endpoint: ${namespace}/${service}"
+}
+
+validate_hubble_timescape_pipeline() {
+  local attempt pods pod fluentd_logs timescape_logs missing
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    pods="$(kctl -n kube-system get pod -l app.kubernetes.io/instance=hubble-enterprise \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+    missing=0
+    while IFS= read -r pod; do
+      [[ -n "${pod}" ]] || continue
+      fluentd_logs="$(kctl -n kube-system logs "${pod}" --tail=2000 2>/dev/null || true)"
+      if ! grep -F 'following tail of /var/run/cilium/hubble/hubble.log' \
+        <<< "${fluentd_logs}" >/dev/null; then
+        missing=1
+      fi
+    done <<< "${pods}"
+
+    timescape_logs="$(kctl -n kube-system logs hubble-timescape-lite-0 \
+      -c timescape --since=10m 2>/dev/null || true)"
+    if [[ -n "${pods}" && "${missing}" -eq 0 ]] && \
+      grep -E 'push(\.insert)?\.flows\.flushed=[1-9][0-9]*(\.[0-9]+)?/s' \
+        <<< "${timescape_logs}" >/dev/null; then
+      log "Hubble Enterprise is tailing every node and Timescape is flushing historical flows"
+      return 0
+    fi
+    sleep 5
+  done
+  die "Hubble Enterprise to Timescape historical flow pipeline did not become active"
+}
+
+log "preflight: local tool versions"
+terraform version
+kubectl version --client
+helm version --short
+
+log "preflight: static syntax and Terraform format"
+bash -n "${SCRIPT_DIR}/kup"
+bash -n "${SCRIPT_DIR}/kiall"
+terraform fmt -check "${WORKDIR}"
+
+log "configure private Isovalent Helm repository"
+helm repo add isovalent "${ISO_REPO_URL}" --force-update >/dev/null
+helm repo update isovalent >/dev/null
+
+export CILIUM_CLUSTER_ID CILIUM_CLUSTER_NAME ACK_POD_CIDR ACK_VPC_CIDR
+export TETRAGON_EXPORT_DIRECTORY TETRAGON_EXPORT_FILENAME TETRAGON_ALERT_EXPORT_DIRECTORY
+export TETRAGON_EXPORT_ALLOWLIST TETRAGON_EXPORT_DENYLIST TETRAGON_CGROUP_RATE
+
+CILIUM_VALUES="${RUNTIME_DIR}/cilium-enterprise-values.yaml"
+TETRAGON_VALUES="${RUNTIME_DIR}/tetragon.yaml"
+TPR_VALUES="${RUNTIME_DIR}/tpr-values.yaml"
+render_template "${SCRIPT_DIR}/cilium-enterprise-values.yaml" "${CILIUM_VALUES}"
+render_template "${SCRIPT_DIR}/tetragon.yaml" "${TETRAGON_VALUES}"
+render_template "${SCRIPT_DIR}/tpr-values.yaml" "${TPR_VALUES}"
+
+validate_chart cilium isovalent/cilium "${CILIUM_CHART_VER}" "${CILIUM_VALUES}"
+validate_chart hubble-ui isovalent/hubble-ui "${HUBBLE_UI_CHART_VER}" "${SCRIPT_DIR}/hubble-ui-values.yaml"
+validate_chart hubble-timescape isovalent/hubble-timescape "${HUBBLE_TIMESCAPE_CHART_VER}" "${SCRIPT_DIR}/hubble-timescape-values.yaml"
+validate_chart hubble-enterprise isovalent/hubble-enterprise "${HUBBLE_ENTERPRISE_CHART_VER}" "${SCRIPT_DIR}/hubble-enterprise-values.yaml"
+validate_chart tetragon isovalent/tetragon "${TETRAGON_CHART_VER}" "${TETRAGON_VALUES}"
+validate_chart tetragon-policies isovalent/tetragon-policies "${TPR_CHART_VER}" "${TPR_VALUES}"
+
+log "initialize and validate Terraform"
+run_terraform init -input=false
+run_terraform validate
+
+log "apply Terraform-owned ACK infrastructure"
+terraform_apply
+
+[[ -s "${KUBECONFIG_FILE}" ]] || die "Terraform did not generate ${KUBECONFIG_FILE}"
+chmod 600 "${KUBECONFIG_FILE}"
+normalize_context
+wait_for_api
+wait_for_nodes_and_podcidrs
+
+log "install Cilium Enterprise"
+helm_upgrade cilium isovalent/cilium \
+  --version "${CILIUM_CHART_VER}" \
+  --namespace kube-system \
+  -f "${CILIUM_VALUES}"
+
+kctl -n kube-system rollout status deployment/cilium-operator --timeout="${CILIUM_ROLLOUT_TIMEOUT}"
+kctl -n kube-system rollout status daemonset/cilium --timeout="${CILIUM_ROLLOUT_TIMEOUT}"
+kctl wait --for=condition=Ready node --all --timeout="${CILIUM_ROLLOUT_TIMEOUT}"
+wait_for_cilium_health
+restart_cilium_if_flow_export_missing
+kctl -n kube-system rollout status deployment/cilium-operator --timeout="${CILIUM_ROLLOUT_TIMEOUT}"
+kctl -n kube-system rollout status daemonset/cilium --timeout="${CILIUM_ROLLOUT_TIMEOUT}"
+kctl wait --for=condition=Ready node --all --timeout="${CILIUM_ROLLOUT_TIMEOUT}"
+wait_for_cilium_health
+wait_for_hubble_flow_export
+
+log "install AWS-reference Hubble UI Enterprise"
+helm_upgrade hubble-ui isovalent/hubble-ui \
+  --version "${HUBBLE_UI_CHART_VER}" \
+  --namespace kube-system \
+  -f "${SCRIPT_DIR}/hubble-ui-values.yaml" \
+  --wait --timeout "${HELM_ROLLOUT_TIMEOUT}"
+
+log "install AWS-reference standalone Timescape Lite"
+helm_upgrade hubble-timescape isovalent/hubble-timescape \
+  --version "${HUBBLE_TIMESCAPE_CHART_VER}" \
+  --namespace kube-system \
+  -f "${SCRIPT_DIR}/hubble-timescape-values.yaml" \
+  --wait --timeout "${HELM_ROLLOUT_TIMEOUT}"
+
+log "install AWS-reference Hubble Enterprise push pipeline"
+helm_upgrade hubble-enterprise isovalent/hubble-enterprise \
+  --version "${HUBBLE_ENTERPRISE_CHART_VER}" \
+  --namespace kube-system \
+  -f "${SCRIPT_DIR}/hubble-enterprise-values.yaml" \
+  --wait --timeout "${HELM_ROLLOUT_TIMEOUT}"
+
+validate_service_endpoint kube-system hubble-relay
+validate_service_endpoint kube-system hubble-ui
+validate_service_endpoint kube-system hubble-timescape
+validate_service_endpoint kube-system hubble-timescape-ingester
+validate_hubble_timescape_pipeline
+
+log "install Tetragon Enterprise"
+helm_upgrade tetragon isovalent/tetragon \
+  --version "${TETRAGON_CHART_VER}" \
+  --namespace kube-system \
+  -f "${TETRAGON_VALUES}"
+kctl -n kube-system rollout status daemonset/tetragon --timeout="${TETRAGON_ROLLOUT_TIMEOUT}"
+if kctl -n kube-system get deployment tetragon-operator >/dev/null 2>&1; then
+  kctl -n kube-system rollout status deployment/tetragon-operator --timeout="${TETRAGON_ROLLOUT_TIMEOUT}"
+fi
+
+log "install Tetragon Policy Ruleset"
+helm_upgrade tetragon-policies isovalent/tetragon-policies \
+  --version "${TPR_CHART_VER}" \
+  --namespace kube-system \
+  -f "${TPR_VALUES}" \
+  --wait --timeout "${TETRAGON_ROLLOUT_TIMEOUT}"
+
+log "deploy Alibaba-friendly test and mini-boutique workloads"
+ensure_namespace "${TEST_NAMESPACE}"
+ensure_namespace "${DEMO_NAMESPACE}"
+kctl apply -f "${SCRIPT_DIR}/ns_test/testcurl.yaml"
+kctl apply -f "${SCRIPT_DIR}/ns_demo/mini-boutique-lite.yaml"
+kctl -n "${TEST_NAMESPACE}" rollout status daemonset/testcurl --timeout=15m
+kctl -n "${DEMO_NAMESPACE}" wait --for=condition=Available deployment --all --timeout=20m
+kctl -n "${DEMO_NAMESPACE}" wait --for=condition=Ready pod --all --timeout=20m
+
+log "apply non-blocking Cilium L7 visibility policy"
+kctl apply -f "${SCRIPT_DIR}/ns_demo/cnp-l7-visibility.yaml"
+
+validate_application_networking
+validate_tetragon_runtime
+
+log "final component summary"
+kctl get nodes -o wide
+kctl -n kube-system get pods -o wide
+kctl -n "${TEST_NAMESPACE}" get pods -o wide
+kctl -n "${DEMO_NAMESPACE}" get pods -o wide
+hctl list --all-namespaces
+
+cat <<EOF
+
+================================================================
+NEXT STEPS
+----------------------------------------------------------------
+# Hubble UI Enterprise (live Hubble Relay + historical Timescape)
+kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" \\
+  -n kube-system port-forward svc/hubble-ui "${HUBBLE_UI_LOCAL_PORT}:80"
+# Open http://127.0.0.1:${HUBBLE_UI_LOCAL_PORT}
+
+# ACK and Cilium
+kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" get nodes -o wide
+kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" \\
+  -n kube-system exec daemonset/cilium -c cilium-agent -- cilium-dbg status
+
+# Tetragon policies
+kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" get tracingpolicies
+kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" get alertrules
+
+# Destroy the complete disposable demo
+${SCRIPT_DIR}/kiall
+================================================================
+EOF
+
+log "SUCCESS: ACK BYOCNI demo converged using project-private context ${ACK_CONTEXT}"

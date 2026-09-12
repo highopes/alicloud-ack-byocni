@@ -1,0 +1,71 @@
+exportDirectory: "${TETRAGON_EXPORT_DIRECTORY}"
+
+tetragon:
+  btf: /sys/kernel/btf/vmlinux
+  enableCiliumAPI: true
+  exportAllowList: '${TETRAGON_EXPORT_ALLOWLIST}'
+  exportDenyList: '${TETRAGON_EXPORT_DENYLIST}'
+  fieldFilters: |-
+    {"event_set":["PROCESS_CONNECT"],"fields":"process.exec_id,protocol,source_ip,source_port,destination_ip,destination_port","action":"INCLUDE"}
+    {"event_set":["PROCESS_ACCEPT"],"fields":"process.exec_id,protocol,source_ip,source_port,destination_ip,destination_port","action":"INCLUDE"}
+  exportFilename: "${TETRAGON_EXPORT_FILENAME}"
+
+  enableProcessCred: true
+  enableProcessNs: true
+
+  processAncestors:
+    enabled: "base,lsm"
+
+  enablePolicyFilter: true
+  enablePolicyFilterCgroupMap: true
+
+  cgidmap:
+    enabled: true
+
+  dns:
+    enabled: false
+  enableBPFDNSParser: false
+
+  layer3:
+    udp:
+      enabled: true
+    tcp:
+      enabled: true
+
+  cri:
+    enabled: true
+    socketHostPath: /run/containerd/containerd.sock
+
+  debug: false
+  enablePolicyFilterDebug: false
+
+  enableApplicationModel: false
+  applicationModelExportFilename: ""
+  applicationModel:
+    enabled: false
+    useDefaultRules: false
+
+  enableExportAggregation: false
+
+  alerts:
+    enabled: true
+    exportDirectory: "${TETRAGON_ALERT_EXPORT_DIRECTORY}"
+
+  extraArgs:
+    event-queue-size: "100000"
+    cgroup-rate: "${TETRAGON_CGROUP_RATE}"
+
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+
+  resources:
+    requests:
+      cpu: "600m"
+      memory: "512Mi"
+    limits:
+      memory: "2Gi"
+
+tetragonOperator:
+  enabled: true

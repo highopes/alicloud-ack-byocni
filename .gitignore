@@ -1,0 +1,20 @@
+.DS_Store
+.bak/
+.agent-context/
+
+# Private configuration and cluster credentials
+kup.conf
+kubeconfig
+kubeconfig.*
+
+# Terraform runtime and sensitive state
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Rendered Helm values/manifests and temporary logs
+runtime/
+*.log

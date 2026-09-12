@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: testcurl
+  namespace: test
+  labels:
+    app: testcurl
+spec:
+  selector:
+    matchLabels:
+      app: testcurl
+  template:
+    metadata:
+      labels:
+        app: testcurl
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: testcurl
+        image: registry.cn-hangzhou.aliyuncs.com/acs/alpine:3.18-update
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          sed -i -E 's#https?://[^/]+/alpine#https://mirrors.aliyun.com/alpine#g' /etc/apk/repositories
+          apk add --no-cache curl busybox-extras
+          telnetd
+          exec sleep 10000
+        readinessProbe:
+          exec:
+            command:
+              - sh
+              - -c
+              - command -v curl >/dev/null && command -v nslookup >/dev/null
+          initialDelaySeconds: 2
+          periodSeconds: 2
+          timeoutSeconds: 1
+          failureThreshold: 30
+        resources: {}
+      restartPolicy: Always
