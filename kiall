@@ -64,7 +64,11 @@ redact_secrets() {
 import os, sys
 values = [
     os.environ.get(name, "")
-    for name in ("ALICLOUD_ACCESS_KEY", "ALICLOUD_SECRET_KEY", "ACK_NODE_PASSWORD")
+    for name in (
+        "ALICLOUD_ACCESS_KEY", "ALICLOUD_SECRET_KEY", "ACK_NODE_PASSWORD",
+        "GALILEO_REGISTRY_USERNAME", "GALILEO_REGISTRY_PASSWORD",
+        "GALILEO_SPLUNK_AO_API_KEY", "GALILEO_APP_MODEL_API_KEY", "GALILEO_PINECONE_API_KEY",
+    )
 ]
 for line in sys.stdin:
     for value in values:

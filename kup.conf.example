@@ -1,5 +1,5 @@
 # Public defaults for the ACK BYOCNI demo.
-# Copy this file to kup.conf and replace exactly the three placeholders below.
+# Copy this file to kup.conf and replace every ReplaceMe placeholder.
 
 KUP_WORKDIR="${SCRIPT_DIR}"
 KUBECONFIG_FILE="${KUP_WORKDIR}/kubeconfig"
@@ -40,6 +40,35 @@ HUBBLE_ENTERPRISE_CHART_VER="1.13.4"
 DEMO_NAMESPACE="demo"
 TEST_NAMESPACE="test"
 HUBBLE_UI_LOCAL_PORT="18080"
+
+# Multi-agent banking chatbot from https://github.com/highopes/galileo-demo.
+# The image must be an immutable linux/amd64 digest already published to the
+# configured registry. Registry, model, Splunk AO, and Pinecone credentials
+# stay only in the private kup.conf.
+GALILEO_NAMESPACE="galileo-demo"
+GALILEO_SOURCE_URL="https://github.com/highopes/galileo-demo"
+GALILEO_SOURCE_COMMIT="bb87e2ceec3e75cf875417984be3de3131e34ea0"
+GALILEO_IMAGE_REF="ReplaceMe"
+GALILEO_REGISTRY_SERVER="ReplaceMe"
+GALILEO_REGISTRY_USERNAME="ReplaceMe"
+GALILEO_REGISTRY_PASSWORD="ReplaceMe"
+GALILEO_SPLUNK_AO_API_KEY="ReplaceMe"
+GALILEO_SPLUNK_AO_PROJECT="Multi-Agent Banking Chatbot"
+GALILEO_SPLUNK_AO_AGENT_STREAM="Default Agent Stream"
+GALILEO_SPLUNK_AO_CONSOLE_URL="https://console.multitenant.galileocloud.io"
+GALILEO_APP_MODEL_PROVIDER="bailian"
+GALILEO_APP_MODEL_NAME="qwen3.7-flash"
+GALILEO_APP_MODEL_BASE_URL="ReplaceMe"
+GALILEO_APP_MODEL_API_KEY="ReplaceMe"
+GALILEO_MODEL_REQUEST_TIMEOUT="120"
+GALILEO_MODEL_MAX_RETRIES="2"
+GALILEO_PINECONE_API_KEY="ReplaceMe"
+GALILEO_PINECONE_INDEX_NAME="credit-card-information-qwen-demo"
+GALILEO_PINECONE_NAMESPACE="bank-docs"
+GALILEO_PINECONE_TEXT_FIELD="chunk_text"
+GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS="Action Advancement - Qwen,Action Completion - Qwen,Tool Errors - Qwen,Tool Selection Quality - Qwen"
+GALILEO_SPLUNK_AO_EXPERIMENT_DATASET=""
+GALILEO_LOCAL_PORT="8000"
 
 TETRAGON_EXPORT_DIRECTORY="/var/run/cilium/hubble"
 TETRAGON_EXPORT_FILENAME="tetragon.log"

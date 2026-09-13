@@ -15,7 +15,7 @@
 
 - 正常 lifecycle 完全在本地 Mac 执行，唯一入口为 `./kup` 和 `./kiall`。
 - Terraform 管理 ACK Pro、VPC、vSwitch、NAT/public API 配置与固定 3-Worker Node Pool。
-- `kup.conf` 统一私有配置；公开 example 只有 AccessKey ID、AccessKey Secret、Node password 三个 placeholder，Enterprise repository 变量名和值都不进入 example。
+- `kup.conf` 统一私有配置；公开 example 对 ACK 与 Galileo 的所有敏感值只提供 `ReplaceMe`，Enterprise repository 变量名和值都不进入 example。
 - ACK kubeconfig 固定为项目内 `./kubeconfig`，context 归一化为 `ack-byocni-demo`。所有 kubectl/Helm 命令显式指定 kubeconfig/context，不 merge 或修改 `~/.kube/config`。
 - 保留 ACK BYOCNI、Kubernetes IPAM、VPC Route/Native Routing、KPR、Hubble Relay 与 AliyunLinux3 BPF LSM bootstrap。
 - Integrated Timescape 完全移除，替换为 AWS 本地参考已验证的 Hubble UI Enterprise + Standalone Timescape Lite + Hubble Enterprise fluentd HTTP push pipeline。
@@ -185,9 +185,19 @@ re-run kup after transient/interrupted Helm metadata recovery
 - 最终 lifecycle 的一次人为中断发生在 destroy 已移除部分 state 后；按设计 state 与 kubeconfig 均保留并可续跑。该中断同时发现 Provider refresh 会重新生成 0644 kubeconfig，`kiall` 现增加 EXIT trap：只要文件仍存在，无论成功、失败、Ctrl-C 都恢复 0600；完整 destroy 成功后仍删除该文件。
 - 一次完整 fresh `kup` 的运行期检查全部通过且命令返回 0，但 Helm 最终清单显示 Cilium 与 Timescape 因 ACK API 在写最终 release Secret 时断线而停在 `pending-install`。`helm upgrade` 在该场景仍返回 0，单靠进程退出码不足。`kup` 现对每次 Helm 操作额外读取 release status 并强制要求 `deployed`；重试前仅删除最新的 `pending-*` revision Secret（包括没有稳定前序 revision 的 interrupted install），不删除 workload 或任何 deployed revision。
 
+## Galileo application extension — 2026-09-13
+
+- 上游来源固定为 `https://github.com/highopes/galileo-demo` commit `bb87e2ceec3e75cf875417984be3de3131e34ea0`。`kup` 不在 lifecycle 中临时 clone 或 build；部署该提交已完成 smoke/push 的 `linux/amd64` ACR immutable digest，避免 Docker/Colima 与 mutable tag 依赖。
+- 新增 `ns_galileo/multi-agent-banking.yaml`：`galileo-demo` Namespace、非 Secret ConfigMap、单副本 non-root Deployment 与 ClusterIP Service。禁用 ServiceAccount token、drop all capabilities，不创建 LoadBalancer、Ingress、PVC 或新的 ACR/Pinecone/Splunk AO 控制面资源。
+- `kup.conf.example` 增加完整 `GALILEO_*` 接口，敏感字段只有 `ReplaceMe`；真实 ACR、Splunk AO、百炼、Pinecone 值已从获授权的本地 Galileo `.secrets`/resolved runtime 写入 ignored、0600 的 `kup.conf`。VLLM Judge key、Docker Hub PAT 与 Alibaba RAM credential 不注入应用 Pod。
+- `kup` 使用临时 0600 文件生成 runtime Secret 与 Docker config Secret，apply 后通过 trap 立即清理；Terraform/命令输出脱敏器也覆盖新增凭据。
+- 新增硬检查：Deployment 必须使用配置的 `@sha256` digest，Service 必须有 endpoint，testcurl 必须能访问 Chainlit HTTP；Pod 内上游 `pod_network_smoke.py` 必须验证应用模型 DNS/TLS/认证与精确 model ID、Pinecone integrated text search 和 Splunk AO HTTPS。
+- 第一次纳入 `kup` 时 Deployment 已完成滚动且新 Pod Ready，但紧随其后的 `kubectl exec deployment/...` 仍选中正在删除的旧 Replica，返回 Pod NotFound。验证现显式选择没有 deletion timestamp 且 Ready 的当前 Pod，并进行最多三次、间隔 5 秒的有界 exec；最终失败仍是硬错误。
+- 状态：passed。修复上述 Replica 竞态后，定向检查确认镜像 digest、ClusterIP HTTP、应用模型、Pinecone 与 Splunk AO 全部通过；随后完整重复执行 `./kup` 返回 0，Terraform 为 `0 added, 0 changed, 0 destroyed`，Galileo Secret/Service 幂等保持、Deployment 为 1/1 Ready，全部原有 ACK/Cilium/Hubble/Tetragon/mini-boutique 检查也再次通过。期间 ACK API 的一次短暂连接超时及一个 Timescape pending revision 均由既有限重试/精确恢复逻辑收敛。
+
 ## Acceptance result and remaining issues
 
-Migration completed。正常路径已是 Mac-only `kup`/`kiall`，Cloud Shell、Integrated Timescape、独立 `tup`、全局 kube context 与 state 外 aggressive cleanup 都不在 baseline。`kup -> kup -> kiall -> kiall -> kup` 的真实生命周期已覆盖，并额外验证中断销毁恢复、pending Helm revision 恢复与最终 Terraform zero-diff 收敛。Roadmap 项未进入 baseline。
+Migration completed。正常路径已是 Mac-only `kup`/`kiall`，Cloud Shell、Integrated Timescape、独立 `tup`、全局 kube context 与 state 外 aggressive cleanup 都不在 baseline。`kup -> kup -> kiall -> kiall -> kup` 的真实基础设施生命周期已覆盖；Galileo 扩展也已完成真实部署、定向检查和完整 zero-diff `kup` 重跑，并额外验证中断销毁恢复、pending Helm revision 恢复。Roadmap 项未进入 baseline。
 
 没有已知的 migration 功能阻塞。Alibaba VPC/ACK API 在验证期间出现过短暂 connection reset/HTTP2 loss；有限重试、Helm `deployed` 门禁和幂等重跑已实测恢复，最终不再有 pending release。
 
