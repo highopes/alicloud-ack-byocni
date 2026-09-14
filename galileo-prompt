@@ -7,15 +7,17 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; 
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${KUP_CONFIG:-${SCRIPT_DIR}/kup.conf}"
-PROFILE="${1:-status}"
+COMMAND="${1:-status}"
 CUSTOM_PROMPT_FILE="${2:-}"
+QWEN_BASELINE_PROMPT_FILE="${SCRIPT_DIR}/ns_galileo/supervisor-baseline-qwen.txt"
+PROFILE="${COMMAND}"
 
 usage() {
-  printf 'usage: %s status|baseline|improved|custom [custom-prompt-file]\n' "$0" >&2
+  printf 'usage: %s status|official-baseline|qwen-baseline|baseline|improved|custom [custom-prompt-file]\n' "$0" >&2
 }
 
-case "${PROFILE}" in
-  status|baseline|improved)
+case "${COMMAND}" in
+  status|baseline|official-baseline|qwen-baseline|improved)
     [[ -z "${CUSTOM_PROMPT_FILE}" ]] || { usage; exit 2; }
     ;;
   custom)
@@ -24,6 +26,16 @@ case "${PROFILE}" in
   *)
     usage
     exit 2
+    ;;
+esac
+
+case "${COMMAND}" in
+  baseline|official-baseline)
+    PROFILE="baseline"
+    ;;
+  qwen-baseline)
+    PROFILE="custom"
+    CUSTOM_PROMPT_FILE="${QWEN_BASELINE_PROMPT_FILE}"
     ;;
 esac
 
@@ -44,6 +56,7 @@ GALILEO_PROMPT_SYNC_TIMEOUT_SEC="${GALILEO_PROMPT_SYNC_TIMEOUT_SEC:-300}"
 need kubectl
 need python3
 [[ -f "${KUBECONFIG_FILE}" ]] || die "project-private kubeconfig not found: ${KUBECONFIG_FILE}; run ./kup first"
+[[ -f "${QWEN_BASELINE_PROMPT_FILE}" ]] || die "Qwen baseline prompt not found: ${QWEN_BASELINE_PROMPT_FILE}"
 [[ "${RUNTIME_DIR}" == "${WORKDIR}/"* ]] || die "RUNTIME_DIR must remain inside KUP_WORKDIR"
 [[ "${GALILEO_PROMPT_SYNC_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]] \
   || die "GALILEO_PROMPT_SYNC_TIMEOUT_SEC must be a positive integer"
@@ -74,7 +87,8 @@ for pod in json.load(sys.stdin).get("items", []):
 }
 
 show_status() {
-  local snapshot pod_name pod_uid restart_count image_id image_digest configured mounted resolved
+  local snapshot pod_name pod_uid restart_count image_id image_digest configured mounted
+  local resolved_state resolved resolved_digest qwen_digest selection
   snapshot="$(ready_pod_snapshot)"
   [[ -n "${snapshot}" ]] || die "no Ready Galileo application Pod found"
   IFS=$'\t' read -r pod_name pod_uid restart_count image_id <<< "${snapshot}"
@@ -82,11 +96,35 @@ show_status() {
     -o jsonpath='{.data.SUPERVISOR_PROMPT_PROFILE}')"
   mounted="$(kctl -n "${GALILEO_NAMESPACE}" exec "${pod_name}" -- \
     sh -c 'test -n "$SUPERVISOR_PROMPT_PROFILE_FILE" && cat "$SUPERVISOR_PROMPT_PROFILE_FILE"')"
-  resolved="$(kctl -n "${GALILEO_NAMESPACE}" exec "${pod_name}" -- python -c \
-    'from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt; print(resolve_supervisor_prompt()[0])')"
+  resolved_state="$(kctl -n "${GALILEO_NAMESPACE}" exec "${pod_name}" -- python -c \
+    'from hashlib import sha256; from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt; p,v=resolve_supervisor_prompt(); print(p+"\\t"+sha256(v.encode()).hexdigest())')"
+  IFS=$'\t' read -r resolved resolved_digest <<< "${resolved_state}"
+  qwen_digest="$(python3 - "${QWEN_BASELINE_PROMPT_FILE}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+prompt = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+print(hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+PY
+)"
+  case "${resolved}" in
+    baseline) selection="official-baseline" ;;
+    improved) selection="improved" ;;
+    custom)
+      if [[ "${resolved_digest}" == "${qwen_digest}" ]]; then
+        selection="qwen-baseline (custom hot patch)"
+      else
+        selection="custom"
+      fi
+      ;;
+    *) selection="unknown" ;;
+  esac
   printf 'Configured prompt profile: %s\n' "${configured}"
   printf 'Mounted prompt profile: %s\n' "${mounted}"
   printf 'Resolved application profile: %s\n' "${resolved}"
+  printf 'Resolved prompt selection: %s\n' "${selection}"
+  printf 'Resolved prompt SHA-256: %s\n' "${resolved_digest}"
   printf 'Application Pod: %s\n' "${pod_name}"
   printf 'Pod UID: %s\n' "${pod_uid}"
   printf 'Container restart count: %s\n' "${restart_count}"
@@ -184,4 +222,4 @@ IFS=$'\t' read -r after_pod after_uid after_restarts after_image_id <<< "${after
   || die "application image changed during a ConfigMap-only prompt switch"
 
 show_status
-log "prompt switch complete; Pod and image were preserved. Start a new Chainlit chat to use ${PROFILE}."
+log "prompt switch complete; Pod and image were preserved. Start a new Chainlit chat to use ${COMMAND}."

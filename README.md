@@ -112,9 +112,9 @@ GALILEO_APP_MODEL_API_KEY        当前应用模型的 API key
 GALILEO_PINECONE_API_KEY         Pinecone API key
 ```
 
-`GALILEO_SUPERVISOR_PROMPT_PROFILE` 控制每次 `kup` 的 Fresh deployment profile，只能是 `baseline` 或 `improved`，默认 `baseline`；任意自定义 prompt 应在部署后通过 `./galileo-prompt custom ...` 设置。`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 是等待 projected ConfigMap 被 kubelet 刷新并被应用 resolver 读到的墙钟时间上限，默认 300 秒。
+`GALILEO_SUPERVISOR_PROMPT_PROFILE` 控制 `kup` 安装后进入 baseline 演示还是直接进入 improved，取值为 `baseline`（默认）或 `improved`。当它是 `baseline` 时，新变量 `GALILEO_BASELINE_PROMPT_VARIANT` 决定采用哪套 baseline：默认 `qwen` 会把仓库内的 Qwen 专用 baseline 以 `custom` ConfigMap 热补丁加载；`official` 则保留当前不可变镜像内更适合 GPT 类模型的官方 baseline。若 profile 是 `improved`，baseline variant 不生效。`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 是等待 projected ConfigMap 被 kubelet 刷新并被应用 resolver 读到的墙钟时间上限，默认 300 秒。
 
-本次验证的私有 `kup.conf` 已从同级 Galileo working copy 的 `.secrets` 与 `.runtime` resolved files 初始化：应用使用百炼 `qwen3.7-flash`、隔离 Pinecone index `credit-card-information-qwen-demo`，镜像固定为上游 commit `26ea7c0c3276cde94b6f5c1bff2b0d741d655858` 对应的 ACR digest。`kup` 不需要 Docker，也不会重新 build/push 镜像。更新上游代码时，应先在 Galileo repo 重新完成 build、push 和 smoke，再一起更新 `GALILEO_SOURCE_COMMIT` 与 `GALILEO_IMAGE_REF`，禁止使用 `latest`。
+本次验证的私有 `kup.conf` 已从同级 Galileo working copy 的 `.secrets` 与 `.runtime` resolved files 初始化：应用使用百炼 `qwen3.7-flash`、隔离 Pinecone index `credit-card-information-qwen-demo`，镜像仍固定为上游 commit `26ea7c0c3276cde94b6f5c1bff2b0d741d655858` 对应的 ACR digest。上游 commit `4ce9a4d24adc3bf91783cd68383a79b63e46cad4` 只提供新的 Qwen baseline 文本，本仓库将该文本保存为 `ns_galileo/supervisor-baseline-qwen.txt` 并动态加载，因此没有更换镜像。`kup` 不需要 Docker，也不会重新 build/push 镜像。真正更新应用镜像时，应先在 Galileo repo 重新完成 build、push 和 smoke，再一起更新 `GALILEO_SOURCE_COMMIT` 与 `GALILEO_IMAGE_REF`，禁止使用 `latest`。
 
 运行期 Pod 只注入 Splunk AO、最终 application model 与 Pinecone 三个 key；VLLM Judge key、Docker Hub PAT、RAM AccessKey 和 ACR push credential 不会进入应用 Pod。若要展示四个 Qwen Evaluator 或 Experiment，需预先在 Splunk AO UI 中确认 Project、Agent Stream、Evaluator 与 Dataset；`kup` 不修改这些控制面对象。
 
@@ -253,25 +253,37 @@ kubectl \
   port-forward svc/splunk-ao-banking-qwen 8000:80
 ```
 
-打开 <http://127.0.0.1:8000>。这是 Galileo repo 的 Chainlit/LangGraph Multi-agent banking chatbot；Service 保持 ClusterIP，不创建 Ingress 或公网 LoadBalancer。另开一个终端运行 `./galileo-prompt status`，确认 ConfigMap、挂载文件和应用 resolver 三处 profile 一致。
+打开 <http://127.0.0.1:8000>。这是 Galileo repo 的 Chainlit/LangGraph Multi-agent banking chatbot；Service 保持 ClusterIP，不创建 Ingress 或公网 LoadBalancer。另开一个终端运行 `./galileo-prompt status`，确认 ConfigMap、挂载文件和应用 resolver 三处 profile 一致。默认 Qwen baseline 在应用内部使用 `custom` profile，状态输出会进一步把对应内容哈希识别为 `qwen-baseline (custom hot patch)`。
 
-### 第一阶段：baseline 故障演示
+### 三套演示提示词与切换
 
-`kup` 默认清空自定义 prompt 并恢复 `baseline`。也可以在演示前显式执行：
+当前不可变镜像保留官方 baseline；Qwen baseline 不覆盖它，而是复用动态 `custom` profile。三套提示词及命令如下：
+
+| 演示提示词 | 切换命令 | 应用 profile / Session 标签 | 用途 |
+|---|---|---|---|
+| 官方 baseline | `./galileo-prompt official-baseline` | `baseline` / `[baseline]` | 官方故意不完整版本，更适合 GPT 类模型；`baseline` 是此命令的兼容别名 |
+| Qwen baseline | `./galileo-prompt qwen-baseline` | `custom` / `[custom]` | 针对 Qwen 构造的故障版；这是 `kup.conf.example` 和当前私有配置的默认值 |
+| improved | `./galileo-prompt improved` | `improved` / `[improved]` | 明确支持 credit-score agent，并正确交付工具结果 |
+
+每条切换命令都会等待 ConfigMap 投影和应用 resolver 收敛，并核对 Pod UID、restart count 与 image ID 没有变化。切换完成后必须在 Chainlit 中**新建聊天**；已开始的聊天继续使用创建 Session 时的 prompt。
+
+### 第一阶段：Qwen baseline 故障演示
+
+`kup` 默认以 `GALILEO_SUPERVISOR_PROMPT_PROFILE="baseline"` 和 `GALILEO_BASELINE_PROMPT_VARIANT="qwen"` 结束安装，也可以在演示前显式恢复同一状态：
 
 ```bash
-./galileo-prompt baseline
+./galileo-prompt qwen-baseline
 ./galileo-prompt status
 ```
 
 建议按以下顺序演示：
 
-1. 新会话输入 `What is my credit score?`，重复 3–5 个独立会话，观察 supervisor 是否稳定转交 credit-score agent 并返回工具支持的 `550`。
+1. 新会话输入 `What is my credit score?`，确认 supervisor 只转交一次 credit-score agent、底层工具返回 `550`，但回到 supervisor 后最终回答 `I cannot answer that question`。
 2. 输入 `What are the cashback rewards offered by the Orbit Credit Card?`，预期 credit-card agent 使用 Pinecone，grounded answer 应说明 Orbit Basic 没有 cashback/rewards。
 3. 输入 `Recommend me a good book.`，预期 supervisor 不调用银行业务 agent，并回答不知道或无法回答。
-4. 在 Splunk AO 对应 Project/Agent Stream 中展开 supervisor、sub-agent、tool 与 model spans，对照 Action Advancement、Action Completion、Tool Errors、Tool Selection Quality 四个 Evaluator；Session 名称包含 `[baseline]`。
+4. 在 Splunk AO 对应 Project/Agent Stream 中展开 supervisor、sub-agent、tool 与 model spans，对照 Action Advancement、Action Completion、Tool Errors、Tool Selection Quality 四个 Evaluator；Qwen baseline 的 Session 名称包含 `[custom]`。
 
-baseline 故意保留上游 supervisor prompt 的已知缺陷：它描述了 credit-card agent，却漏写已经存在的 credit-score agent。因此 credit-score 问题可能正确、只完成 handoff、或直接拒答；这种非确定性正是 Splunk AO Trace/Evaluation 演示内容。
+两套 baseline 都保留官方样例“已存在 credit-score agent，但 supervisor 支持能力只描述 credit-card agent”的故意缺陷。官方文本在 GPT 类模型上适合作为第一阶段，但 `qwen3.7-flash` 会从 tool schema 自动推断缺失能力并正确返回 `550`，从而掩盖故障。Qwen 版因此明确要求只做一次最相关 handoff；score agent/tool 正常返回后，因为 supervisor 仍没有被告知如何交付未列明能力的结果，它会进入原有兜底并回答 `I cannot answer that question`。这只调整 supervisor prompt，不修改 Agent、Graph、工具、固定答案或镜像。
 
 ### 第二阶段：切换 improved prompt
 
@@ -281,9 +293,9 @@ baseline 故意保留上游 supervisor prompt 的已知缺陷：它描述了 cre
 ./galileo-prompt improved
 ```
 
-这个 profile 只给 supervisor 增加 credit-score agent 能力描述。命令会等待 ConfigMap 投影生效，并验证 Pod 名称/UID、restart count 与 image ID 均保持不变。切换完成后必须在 Chainlit 中**新建聊天**，再重复 `What is my credit score?`；已经开始的聊天继续使用创建 Session 时的旧 agent，不会中途改变。新 Splunk AO Session 名称包含 `[improved]`，可与 baseline Trace/Evaluator 结果对比。
+这个 profile 明确给 supervisor 增加 credit-score agent 能力描述并正确交付返回结果。新建聊天后重复 `What is my credit score?`，预期返回工具支持的 `550`。新 Splunk AO Session 名称包含 `[improved]`，可与 Qwen baseline 的 `[custom]` Trace/Evaluator 结果对比。
 
-### 第三阶段：任意自定义 prompt
+### 其他：任意自定义 prompt
 
 将 UTF-8 文本文件写入非 Secret ConfigMap；脚本拒绝空文件和大于 100 KiB 的内容，并验证应用实际解析内容的 SHA-256：
 
@@ -305,13 +317,13 @@ kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo \
   -o jsonpath='{.data.SUPERVISOR_PROMPT_PROFILE}{"\n"}'
 ```
 
-演示结束后恢复故意有缺陷的基线并清空自定义内容：
+演示结束后恢复默认 Qwen baseline：
 
 ```bash
-./galileo-prompt baseline
+./galileo-prompt qwen-baseline
 ```
 
-再次运行 `./kup` 也会恢复 `kup.conf` 中的 `GALILEO_SUPERVISOR_PROMPT_PROFILE` 并清空 custom 值，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
+如需验证官方 baseline，可执行 `./galileo-prompt official-baseline`（或兼容别名 `./galileo-prompt baseline`）；这会清空 custom 内容并回到镜像内置文本。再次运行 `./kup` 会恢复私有配置指定的 profile 和 baseline variant，默认重新热加载 Qwen baseline，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
 
 ## Destroy
 

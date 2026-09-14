@@ -68,7 +68,7 @@ for setting_name in \
   GALILEO_MODEL_MAX_RETRIES GALILEO_PINECONE_API_KEY GALILEO_PINECONE_INDEX_NAME \
   GALILEO_PINECONE_NAMESPACE GALILEO_PINECONE_TEXT_FIELD \
   GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS GALILEO_SUPERVISOR_PROMPT_PROFILE \
-  GALILEO_PROMPT_SYNC_TIMEOUT_SEC GALILEO_LOCAL_PORT; do
+  GALILEO_BASELINE_PROMPT_VARIANT GALILEO_PROMPT_SYNC_TIMEOUT_SEC GALILEO_LOCAL_PORT; do
   require_var "${setting_name}"
 done
 require_bool ACK_ENABLE_NAT_GATEWAY
@@ -83,7 +83,7 @@ for required_file in \
   hubble-ui-values.yaml tetragon.yaml tpr-values.yaml ns_test/testcurl.yaml \
   ns_demo/mini-boutique-lite.yaml ns_demo/cnp-l7-visibility.yaml \
   ns_galileo/multi-agent-banking.yaml ns_galileo/supervisor-production-example.txt \
-  galileo-prompt; do
+  ns_galileo/supervisor-baseline-qwen.txt galileo-prompt; do
   [[ -f "${SCRIPT_DIR}/${required_file}" ]] || die "required file not found: ${SCRIPT_DIR}/${required_file}"
 done
 
@@ -120,6 +120,10 @@ esac
 case "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" in
   baseline|improved) ;;
   *) die "GALILEO_SUPERVISOR_PROMPT_PROFILE must be baseline or improved; use ./galileo-prompt for custom prompts" ;;
+esac
+case "${GALILEO_BASELINE_PROMPT_VARIANT}" in
+  official|qwen) ;;
+  *) die "GALILEO_BASELINE_PROMPT_VARIANT must be official or qwen" ;;
 esac
 [[ "${GALILEO_PROMPT_SYNC_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]] \
   || die "GALILEO_PROMPT_SYNC_TIMEOUT_SEC must be a positive integer"
@@ -501,7 +505,25 @@ validate_application_networking() {
 
 validate_galileo_prompt_runtime() {
   local app_pod="$1"
-  local configured_profile mounted_profile resolved_profile deadline runtime_info
+  local expected_profile expected_custom_hash configured_state configured_profile
+  local configured_custom_hash mounted_profile resolved_profile resolved_prompt_hash
+  local deadline runtime_info
+
+  expected_profile="${GALILEO_SUPERVISOR_PROMPT_PROFILE}"
+  expected_custom_hash=""
+  if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
+    "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
+    expected_profile="custom"
+    expected_custom_hash="$(python3 - "${SCRIPT_DIR}/ns_galileo/supervisor-baseline-qwen.txt" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+prompt = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+print(hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+PY
+)"
+  fi
 
   kctl -n "${GALILEO_NAMESPACE}" get deployment splunk-ao-banking-qwen -o json | python3 -c '
 import json, sys
@@ -531,32 +553,49 @@ if items != expected_items:
     raise SystemExit("Galileo projected prompt ConfigMap items are missing or incorrect")
 '
 
-  configured_profile="$(kctl -n "${GALILEO_NAMESPACE}" get configmap \
+  configured_state="$(kctl -n "${GALILEO_NAMESPACE}" get configmap \
     splunk-ao-banking-qwen-config -o json | python3 -c '
-import json, sys
+import hashlib, json, sys
 data = json.load(sys.stdin).get("data", {})
-if data.get("SUPERVISOR_PROMPT_CUSTOM") != "":
-    raise SystemExit("fresh kup must clear SUPERVISOR_PROMPT_CUSTOM")
-print(data.get("SUPERVISOR_PROMPT_PROFILE", ""))
+custom = data.get("SUPERVISOR_PROMPT_CUSTOM", "")
+digest = hashlib.sha256(custom.encode("utf-8")).hexdigest() if custom else ""
+print(data.get("SUPERVISOR_PROMPT_PROFILE", "") + "\t" + digest)
 ')"
-  [[ "${configured_profile}" == "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" ]] \
-    || die "Galileo ConfigMap prompt profile does not match kup.conf"
+  IFS=$'\t' read -r configured_profile configured_custom_hash <<< "${configured_state}"
+  [[ "${configured_profile}" == "${expected_profile}" ]] \
+    || die "Galileo ConfigMap prompt profile does not match the configured prompt selection"
+  [[ "${configured_custom_hash}" == "${expected_custom_hash}" ]] \
+    || die "Galileo ConfigMap custom prompt does not match the configured prompt selection"
 
   deadline=$((SECONDS + GALILEO_PROMPT_SYNC_TIMEOUT_SEC))
   while (( SECONDS < deadline )); do
     runtime_info="$(kctl -n "${GALILEO_NAMESPACE}" exec "${app_pod}" -- python -c \
-      'import os; from pathlib import Path; from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt; print(Path(os.environ["SUPERVISOR_PROMPT_PROFILE_FILE"]).read_text().strip()+"\t"+resolve_supervisor_prompt()[0])' \
+      'import os; from hashlib import sha256; from pathlib import Path; from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt; p,v=resolve_supervisor_prompt(); print(Path(os.environ["SUPERVISOR_PROMPT_PROFILE_FILE"]).read_text().strip()+"\t"+p+"\t"+sha256(v.encode()).hexdigest())' \
       2>/dev/null || true)"
-    IFS=$'\t' read -r mounted_profile resolved_profile <<< "${runtime_info}"
-    if [[ "${mounted_profile}" == "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" && \
-      "${resolved_profile}" == "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" ]]; then
-      log "Galileo prompt ConfigMap, projected volume, and application resolver use ${resolved_profile}"
+    IFS=$'\t' read -r mounted_profile resolved_profile resolved_prompt_hash <<< "${runtime_info}"
+    if [[ "${mounted_profile}" == "${expected_profile}" && \
+      "${resolved_profile}" == "${expected_profile}" ]] && \
+      { [[ "${expected_profile}" != "custom" ]] || \
+        [[ "${resolved_prompt_hash}" == "${expected_custom_hash}" ]]; }; then
+      log "Galileo prompt ConfigMap, projected volume, and application resolver use ${expected_profile}"
       return 0
     fi
     (( SECONDS < deadline )) || break
     sleep 2
   done
-  die "Galileo prompt projection did not converge to ${GALILEO_SUPERVISOR_PROMPT_PROFILE} within ${GALILEO_PROMPT_SYNC_TIMEOUT_SEC}s"
+  die "Galileo prompt projection did not converge to the configured prompt selection within ${GALILEO_PROMPT_SYNC_TIMEOUT_SEC}s"
+}
+
+apply_galileo_initial_prompt() {
+  if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
+    "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
+    log "hot-load the Qwen baseline through the Galileo custom prompt ConfigMap"
+    KUP_CONFIG="${CONFIG_FILE}" "${SCRIPT_DIR}/galileo-prompt" qwen-baseline
+  elif [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" ]]; then
+    log "keep the immutable image's official baseline prompt"
+  else
+    log "keep the configured Galileo ${GALILEO_SUPERVISOR_PROMPT_PROFILE} prompt profile"
+  fi
 }
 
 validate_galileo_runtime() {
@@ -809,6 +848,7 @@ kctl -n "${GALILEO_NAMESPACE}" rollout status \
   deployment/splunk-ao-banking-qwen --timeout=15m
 kctl -n "${GALILEO_NAMESPACE}" wait --for=condition=Ready pod \
   -l app.kubernetes.io/name=splunk-ao-banking-qwen --timeout=15m
+apply_galileo_initial_prompt
 validate_galileo_runtime
 
 validate_tetragon_runtime
@@ -835,7 +875,7 @@ kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" \\
 kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" \\
   -n "${GALILEO_NAMESPACE}" port-forward svc/splunk-ao-banking-qwen "${GALILEO_LOCAL_PORT}:80"
 # Open http://127.0.0.1:${GALILEO_LOCAL_PORT}
-# Prompt A/B: ${SCRIPT_DIR}/galileo-prompt status|baseline|improved|custom [prompt-file]
+# Prompt demo: ${SCRIPT_DIR}/galileo-prompt status|official-baseline|qwen-baseline|improved|custom [prompt-file]
 
 # ACK and Cilium
 kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" get nodes -o wide
