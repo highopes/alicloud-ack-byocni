@@ -38,6 +38,7 @@ MacBook
                                                +-- test: testcurl DaemonSet
                                                +-- galileo-demo
                                                      +-- Chainlit / LangGraph
+                                                     +-- projected Prompt ConfigMap
                                                      +-- Bailian Qwen application model
                                                      +-- Pinecone integrated search
                                                      +-- Splunk Agent Observability
@@ -111,7 +112,9 @@ GALILEO_APP_MODEL_API_KEY        当前应用模型的 API key
 GALILEO_PINECONE_API_KEY         Pinecone API key
 ```
 
-本次验证的私有 `kup.conf` 已从同级 Galileo working copy 的 `.secrets` 与 `.runtime` resolved files 初始化：应用使用百炼 `qwen3.7-flash`、隔离 Pinecone index `credit-card-information-qwen-demo`，镜像固定为上游 commit `bb87e2ceec3e75cf875417984be3de3131e34ea0` 对应的 ACR digest。`kup` 不需要 Docker，也不会重新 build/push 镜像。更新上游代码时，应先在 Galileo repo 重新完成 build、push 和 smoke，再一起更新 `GALILEO_SOURCE_COMMIT` 与 `GALILEO_IMAGE_REF`，禁止使用 `latest`。
+`GALILEO_SUPERVISOR_PROMPT_PROFILE` 控制每次 `kup` 的 Fresh deployment profile，只能是 `baseline` 或 `improved`，默认 `baseline`；任意自定义 prompt 应在部署后通过 `./galileo-prompt custom ...` 设置。`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 是等待 projected ConfigMap 被 kubelet 刷新并被应用 resolver 读到的墙钟时间上限，默认 300 秒。
+
+本次验证的私有 `kup.conf` 已从同级 Galileo working copy 的 `.secrets` 与 `.runtime` resolved files 初始化：应用使用百炼 `qwen3.7-flash`、隔离 Pinecone index `credit-card-information-qwen-demo`，镜像固定为上游 commit `26ea7c0c3276cde94b6f5c1bff2b0d741d655858` 对应的 ACR digest。`kup` 不需要 Docker，也不会重新 build/push 镜像。更新上游代码时，应先在 Galileo repo 重新完成 build、push 和 smoke，再一起更新 `GALILEO_SOURCE_COMMIT` 与 `GALILEO_IMAGE_REF`，禁止使用 `latest`。
 
 运行期 Pod 只注入 Splunk AO、最终 application model 与 Pinecone 三个 key；VLLM Judge key、Docker Hub PAT、RAM AccessKey 和 ACR push credential 不会进入应用 Pod。若要展示四个 Qwen Evaluator 或 Experiment，需预先在 Splunk AO UI 中确认 Project、Agent Stream、Evaluator 与 Dataset；`kup` 不修改这些控制面对象。
 
@@ -143,7 +146,7 @@ The Isovalent Enterprise Helm repository URL is intentionally omitted from kup.c
 
 `kup` 是幂等的。第一次因 Ctrl-C、网络中断或临时镜像错误停止后，修复原因并再次运行 `./kup` 即可继续收敛；重复执行不会创建第二套 VPC 或 ACK 集群。Terraform 与 Helm 都有有限重试，Helm 命令返回后还会强制确认 release 为 `deployed`；中断留下的最新 `pending-*` revision 会在重试前精确移除，不会删除 workload 或任何 deployed revision。
 
-脚本结束前会自动验证三节点 Ready/PodCIDR、Cilium health、Hubble flow export、Hubble Enterprise -> Timescape ingestion、所有应用 Pod Ready、DNS、pod-to-pod、pod-to-service、外部 HTTPS，以及每节点 Tetragon BPF LSM probe、network event、alert event、TracingPolicy 与 AlertRule。Galileo 还会验证 immutable image、ClusterIP HTTP、模型 DNS/TLS/认证与精确 model ID、Pinecone integrated text search，以及 Splunk AO HTTPS。任一硬检查失败都会返回非零状态。
+脚本结束前会自动验证三节点 Ready/PodCIDR、Cilium health、Hubble flow export、Hubble Enterprise -> Timescape ingestion、所有应用 Pod Ready、DNS、pod-to-pod、pod-to-service、外部 HTTPS，以及每节点 Tetragon BPF LSM probe、network event、alert event、TracingPolicy 与 AlertRule。Galileo 还会验证 immutable image、Prompt ConfigMap 键、projected volume/env 路径、运行中应用解析到的 profile、ClusterIP HTTP、模型 DNS/TLS/认证与精确 model ID、Pinecone integrated text search，以及 Splunk AO HTTPS。任一硬检查失败都会返回非零状态。
 
 自动化只使用：
 
@@ -225,6 +228,7 @@ GALILEO_POD=$(kctl -n galileo-demo get pod \
 kctl -n galileo-demo exec "$GALILEO_POD" -- python pod_network_smoke.py
 kctl -n test exec "$TEST_POD" -- \
   curl -fsS http://splunk-ao-banking-qwen.galileo-demo.svc.cluster.local/ >/dev/null
+./galileo-prompt status
 ```
 
 ## Hubble UI access
@@ -249,16 +253,65 @@ kubectl \
   port-forward svc/splunk-ao-banking-qwen 8000:80
 ```
 
-打开 <http://127.0.0.1:8000>。这是 Galileo repo 的 Chainlit/LangGraph Multi-agent banking chatbot baseline；Service 保持 ClusterIP，不创建 Ingress 或公网 LoadBalancer。
+打开 <http://127.0.0.1:8000>。这是 Galileo repo 的 Chainlit/LangGraph Multi-agent banking chatbot；Service 保持 ClusterIP，不创建 Ingress 或公网 LoadBalancer。另开一个终端运行 `./galileo-prompt status`，确认 ConfigMap、挂载文件和应用 resolver 三处 profile 一致。
+
+### 第一阶段：baseline 故障演示
+
+`kup` 默认清空自定义 prompt 并恢复 `baseline`。也可以在演示前显式执行：
+
+```bash
+./galileo-prompt baseline
+./galileo-prompt status
+```
 
 建议按以下顺序演示：
 
 1. 新会话输入 `What is my credit score?`，重复 3–5 个独立会话，观察 supervisor 是否稳定转交 credit-score agent 并返回工具支持的 `550`。
 2. 输入 `What are the cashback rewards offered by the Orbit Credit Card?`，预期 credit-card agent 使用 Pinecone，grounded answer 应说明 Orbit Basic 没有 cashback/rewards。
 3. 输入 `Recommend me a good book.`，预期 supervisor 不调用银行业务 agent，并回答不知道或无法回答。
-4. 在 Splunk AO 对应 Project/Agent Stream 中展开 supervisor、sub-agent、tool 与 model spans，对照 Action Advancement、Action Completion、Tool Errors、Tool Selection Quality 四个 Evaluator。
+4. 在 Splunk AO 对应 Project/Agent Stream 中展开 supervisor、sub-agent、tool 与 model spans，对照 Action Advancement、Action Completion、Tool Errors、Tool Selection Quality 四个 Evaluator；Session 名称包含 `[baseline]`。
 
-baseline 故意保留上游 supervisor prompt 的已知缺陷：它描述了 credit-card agent，却漏写已经存在的 credit-score agent。因此 credit-score 问题可能正确、只完成 handoff、或直接拒答；这种非确定性正是 Splunk AO Trace/Evaluation 演示内容。`kup` 不自动“修复” prompt，也不创建或修改 Splunk AO Evaluator/Dataset。完整演示与 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
+baseline 故意保留上游 supervisor prompt 的已知缺陷：它描述了 credit-card agent，却漏写已经存在的 credit-score agent。因此 credit-score 问题可能正确、只完成 handoff、或直接拒答；这种非确定性正是 Splunk AO Trace/Evaluation 演示内容。
+
+### 第二阶段：切换 improved prompt
+
+不修改源码、镜像或 Pod，直接把 ConfigMap 切到上游内置的 `improved` profile：
+
+```bash
+./galileo-prompt improved
+```
+
+这个 profile 只给 supervisor 增加 credit-score agent 能力描述。命令会等待 ConfigMap 投影生效，并验证 Pod 名称/UID、restart count 与 image ID 均保持不变。切换完成后必须在 Chainlit 中**新建聊天**，再重复 `What is my credit score?`；已经开始的聊天继续使用创建 Session 时的旧 agent，不会中途改变。新 Splunk AO Session 名称包含 `[improved]`，可与 baseline Trace/Evaluator 结果对比。
+
+### 第三阶段：任意自定义 prompt
+
+将 UTF-8 文本文件写入非 Secret ConfigMap；脚本拒绝空文件和大于 100 KiB 的内容，并验证应用实际解析内容的 SHA-256：
+
+```bash
+# 使用仓库附带的生产化 routing contract 示例
+./galileo-prompt custom ./ns_galileo/supervisor-production-example.txt
+
+# 或使用自己的文件
+./galileo-prompt custom /absolute/path/to/supervisor-prompt.txt
+```
+
+切换完成后新建 Chainlit 聊天，Splunk AO Session 名称会包含 `[custom]`。自定义 prompt 保存在 ConfigMap 中，对有该 namespace 读取权限的人可见，因此不要在提示词中放密码、API key、客户隐私或其他 Secret。
+
+Kubernetes ConfigMap 投影是最终一致的；`./galileo-prompt` 默认按真实墙钟最多等待 300 秒，不需要手工重启 Pod。如果超时，命令会失败并保留诊断信息，不能把 ConfigMap 已修改误报成应用已生效。查看原始配置可执行：
+
+```bash
+kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo \
+  -n galileo-demo get configmap splunk-ao-banking-qwen-config \
+  -o jsonpath='{.data.SUPERVISOR_PROMPT_PROFILE}{"\n"}'
+```
+
+演示结束后恢复故意有缺陷的基线并清空自定义内容：
+
+```bash
+./galileo-prompt baseline
+```
+
+再次运行 `./kup` 也会恢复 `kup.conf` 中的 `GALILEO_SUPERVISOR_PROMPT_PROFILE` 并清空 custom 值，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
 
 ## Destroy
 
@@ -331,6 +384,10 @@ mini-boutique 与 testcurl 已使用 Alibaba Registry 镜像。若仍失败，�
 ### Galileo model, Pinecone, or Splunk AO check fails
 
 `kup` 会在应用 Pod 内运行上游 `pod_network_smoke.py`。模型检查要求 HTTPS `/models` 可认证访问且返回精确 `GALILEO_APP_MODEL_NAME`；Pinecone 检查要求隔离 index/namespace 对 Orbit 查询至少返回一个 hit；Splunk AO console 必须能建立 HTTPS 连接。修复 `kup.conf` 中对应 endpoint/key 或外部服务状态后重跑 `./kup`，不要跳过该硬检查。
+
+### Galileo prompt switch times out
+
+先运行 `./galileo-prompt status` 比较 ConfigMap、挂载文件和 resolver。确认 Deployment 包含 `/etc/banking-prompt` projected ConfigMap volume；旧部署缺少挂载时应重新运行 `./kup`，不要只 patch ConfigMap。正常投影可能需要接近 kubelet 同步周期，可在私有 `kup.conf` 适当增大 `GALILEO_PROMPT_SYNC_TIMEOUT_SEC`。脚本不会通过重启 Pod 掩盖热更新失败。
 
 ### Interrupted kup
 

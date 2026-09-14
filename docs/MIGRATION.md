@@ -163,6 +163,7 @@ re-run kup after transient/interrupted Helm metadata recovery
 | Hubble Enterprise | 1.13.4 |
 | Hubble Timescape | 1.8.4 |
 | Hubble UI | 1.3.12 |
+| Galileo banking chatbot | source `26ea7c0c3276cde94b6f5c1bff2b0d741d655858`, immutable ACR digest |
 
 ## Errors and resolutions
 
@@ -186,20 +187,22 @@ re-run kup after transient/interrupted Helm metadata recovery
 - 一次完整 fresh `kup` 的运行期检查全部通过且命令返回 0，但 Helm 最终清单显示 Cilium 与 Timescape 因 ACK API 在写最终 release Secret 时断线而停在 `pending-install`。`helm upgrade` 在该场景仍返回 0，单靠进程退出码不足。`kup` 现对每次 Helm 操作额外读取 release status 并强制要求 `deployed`；重试前仅删除最新的 `pending-*` revision Secret（包括没有稳定前序 revision 的 interrupted install），不删除 workload 或任何 deployed revision。
 - 2026-09-14 再次从部分 state 收敛时，Alibaba Cloud 以 `InvalidAccountStatus.NotEnoughBalance` 拒绝按量付费 Worker Node Pool 下单。只读 BSS 查询确认账户可用额度低于官方按量付费门槛；VPC、vSwitch 与 ACK 控制面仍在 state 中，失败的 Node Pool 未进入 state。该问题不能通过降低节点数/规格或切换计费类型正确修复。`kup` 现把余额不足、欠费/未支付订单、缺少支付方式和代理商额度不足识别为不可重试计费错误：第一次失败后立即给出恢复指令并保留 state；补足额度后重跑会只继续缺失的 Node Pool。不准备充值时应运行 `./kiall`，避免已创建资源继续计费。真实余额不足回归确认 `kup` 非零退出、没有第二次 apply、state 前后完全一致，且用于分类的 0600 临时脱敏日志已自动删除。
 
-## Galileo application extension — 2026-09-13
+## Galileo application extension — 2026-09-13, updated 2026-09-14
 
-- 上游来源固定为 `https://github.com/highopes/galileo-demo` commit `bb87e2ceec3e75cf875417984be3de3131e34ea0`。`kup` 不在 lifecycle 中临时 clone 或 build；部署该提交已完成 smoke/push 的 `linux/amd64` ACR immutable digest，避免 Docker/Colima 与 mutable tag 依赖。
-- 新增 `ns_galileo/multi-agent-banking.yaml`：`galileo-demo` Namespace、非 Secret ConfigMap、单副本 non-root Deployment 与 ClusterIP Service。禁用 ServiceAccount token、drop all capabilities，不创建 LoadBalancer、Ingress、PVC 或新的 ACR/Pinecone/Splunk AO 控制面资源。
+- 上游来源固定为 `https://github.com/highopes/galileo-demo` commit `26ea7c0c3276cde94b6f5c1bff2b0d741d655858`。`kup` 不在 lifecycle 中临时 clone 或 build；部署该版本已完成 smoke/push 的 `linux/amd64` ACR immutable digest，避免 Docker/Colima 与 mutable tag 依赖。
+- `ns_galileo/multi-agent-banking.yaml` 包含 `galileo-demo` Namespace、非 Secret ConfigMap、单副本 non-root Deployment 与 ClusterIP Service。新版 ConfigMap 增加 `SUPERVISOR_PROMPT_PROFILE`/`SUPERVISOR_PROMPT_CUSTOM`；Deployment 把它们投影到 `/etc/banking-prompt`，应用为每个新 Chainlit Session 解析当前 profile，不需要重建镜像或重启 Pod。仍禁用 ServiceAccount token、drop all capabilities，不创建 LoadBalancer、Ingress、PVC 或新的 ACR/Pinecone/Splunk AO 控制面资源。
 - `kup.conf.example` 增加完整 `GALILEO_*` 接口，敏感字段只有 `ReplaceMe`；真实 ACR、Splunk AO、百炼、Pinecone 值已从获授权的本地 Galileo `.secrets`/resolved runtime 写入 ignored、0600 的 `kup.conf`。VLLM Judge key、Docker Hub PAT 与 Alibaba RAM credential 不注入应用 Pod。
 - `kup` 使用临时 0600 文件生成 runtime Secret 与 Docker config Secret，apply 后通过 trap 立即清理；Terraform/命令输出脱敏器也覆盖新增凭据。
-- 新增硬检查：Deployment 必须使用配置的 `@sha256` digest，Service 必须有 endpoint，testcurl 必须能访问 Chainlit HTTP；Pod 内上游 `pod_network_smoke.py` 必须验证应用模型 DNS/TLS/认证与精确 model ID、Pinecone integrated text search 和 Splunk AO HTTPS。
+- 新增硬检查：Deployment 必须使用配置的 `@sha256` digest；Prompt ConfigMap 键、projected volume/env 路径与应用 resolver 必须收敛到 Fresh deployment profile；Service 必须有 endpoint，testcurl 必须能访问 Chainlit HTTP；Pod 内上游 `pod_network_smoke.py` 必须验证应用模型 DNS/TLS/认证与精确 model ID、Pinecone integrated text search 和 Splunk AO HTTPS。
+- 新增 `galileo-prompt` 操作入口和 `ns_galileo/supervisor-production-example.txt`。脚本支持 `status`、`baseline`、`improved` 和任意 UTF-8 `custom` 文件；使用 0600 临时 JSON merge patch，等待 projected ConfigMap 与 resolver 同步，并要求 Pod UID、restart count 和 image ID 在切换前后完全不变。切回 built-in profile 时会清空 custom 内容。
 - 第一次纳入 `kup` 时 Deployment 已完成滚动且新 Pod Ready，但紧随其后的 `kubectl exec deployment/...` 仍选中正在删除的旧 Replica，返回 Pod NotFound。验证现显式选择没有 deletion timestamp 且 Ready 的当前 Pod，并进行最多三次、间隔 5 秒的有界 exec；最终失败仍是硬错误。
 - 状态：passed。修复上述 Replica 竞态后，定向检查确认镜像 digest、ClusterIP HTTP、应用模型、Pinecone 与 Splunk AO 全部通过；随后完整重复执行 `./kup` 返回 0，Terraform 为 `0 added, 0 changed, 0 destroyed`，Galileo Secret/Service 幂等保持、Deployment 为 1/1 Ready，全部原有 ACK/Cilium/Hubble/Tetragon/mini-boutique 检查也再次通过。期间 ACK API 的一次短暂连接超时及一个 Timescape pending revision 均由既有限重试/精确恢复逻辑收敛。
+- Prompt 版本升级状态：passed。先在原有新版 Pod 上实测 `baseline -> improved -> custom -> baseline`，custom 内容按应用实际解析结果做 SHA-256 一致性校验，全程 Pod UID、restart count 与 image ID 不变。随后完整执行更新后的 `./kup`：Terraform `0 added, 0 changed, 0 destroyed`，六个 Enterprise release 均为 `deployed`，Galileo 滚动到由本仓库清单管理的新 Pod，Fresh profile 为 baseline，Prompt ConfigMap/mount/resolver 与模型、Pinecone、Splunk AO 检查全部通过。`kup` 成功返回后又实测 `improved -> baseline`，新 Pod 仍为同一 UID、0 restart、同一 image ID，最终 custom 为空；容器内 `app.py`、`prompt_profiles.py`、`supervisor_agent.py` 的内容哈希也与所 pin 最新 commit 完全一致。
 
 ## Acceptance result and remaining issues
 
 Migration completed。正常路径已是 Mac-only `kup`/`kiall`，Cloud Shell、Integrated Timescape、独立 `tup`、全局 kube context 与 state 外 aggressive cleanup 都不在 baseline。`kup -> kup -> kiall -> kiall -> kup` 的真实基础设施生命周期已覆盖；Galileo 扩展也已完成真实部署、定向检查和完整 zero-diff `kup` 重跑，并额外验证中断销毁恢复、pending Helm revision 恢复。Roadmap 项未进入 baseline。
 
-没有已知的 migration 功能阻塞。Alibaba VPC/ACK API 在验证期间出现过短暂 connection reset/HTTP2 loss；有限重试、Helm `deployed` 门禁和幂等重跑已实测恢复，最终不再有 pending release。当前这次重建仍受账号可用额度不足这一外部计费条件阻塞；代码已 fail-fast，但只有账号补足额度或恢复信控后才能继续创建 Worker。
+没有已知的 migration 功能阻塞。Alibaba VPC/ACK API 在验证期间出现过短暂 connection reset/HTTP2 loss；有限重试、Helm `deployed` 门禁和幂等重跑已实测恢复，最终不再有 pending release。此前重建曾受账号可用额度不足这一外部计费条件阻塞；当前集群和 Node Pool 已完整收敛，但未来再次 destroy/rebuild 前仍需确认按量付费额度。代码会对该错误 fail-fast 并保留 state。
 
 安全后续：在输出脱敏加入之前，Provider 的一次失败 URL 曾把本次验证所用 RAM AccessKey ID（没有 Secret/password）写入本地任务 transcript。虽然签名参数已过期，仍建议验证后轮换该 RAM AccessKey pair；文档和 tracked 文件中没有写入该值。
