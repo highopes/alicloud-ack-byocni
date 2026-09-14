@@ -280,6 +280,14 @@ baseline 故意保留上游 supervisor prompt 的已知缺陷：它描述了 cre
 
 确认 Mac 能访问 Terraform Registry，然后重试 `./kup`。代理环境需让 Terraform/Go 下载使用同一代理；不要提交 `.terraform/`。
 
+### InvalidAccountStatus.NotEnoughBalance
+
+这是 Alibaba Cloud 账号级计费拒绝，不是 Terraform、ACK、实例规格或 Galileo 配置错误。官方 ECS 错误码说明，订购按量付费产品时账户可用余额通常不得低于 100 元；先在费用与成本控制台补足可用余额、结清欠费并确认支付方式可用，然后原样重跑 `./kup`。如果账号由代理商管理且返回 `InsufficientBalance.AgentCredit`，应联系渠道伙伴补充额度。
+
+`kup` 会在第一次识别到余额、欠费、支付方式或代理商额度错误时立即停止，不做无意义重试。Terraform state 会保留；如果 VPC、vSwitch 或 ACK 控制面已经创建，下一次运行只继续创建缺失的 Node Pool。降低 Worker 数量或规格不能绕过账号级按量付费门槛，也会破坏本 Demo 的 3 节点和内存基线。如果暂时不准备充值，请运行 `./kiall` 释放已经创建且可能继续计费的资源。
+
+参考：[Alibaba Cloud ECS 公共错误码](https://help.aliyun.com/zh/ecs/developer-reference/api-ecs-2014-05-26-errorcodes)、[账号充值说明](https://help.aliyun.com/zh/document_detail/324650.html)。
+
 ### ACK workers initially NotReady
 
 这是 BYOCNI 在 Cilium 安装前的正常状态。只有 Node 对象未出现或 `.spec.podCIDR` 为空超过脚本超时时间才是错误。查看 ACK Node Pool 事件与 ECS 初始化日志。

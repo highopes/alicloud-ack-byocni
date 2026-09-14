@@ -184,6 +184,7 @@ re-run kup after transient/interrupted Helm metadata recovery
 - Rebuild 后的幂等重跑再次在 ACK refresh 的 `DescribeNatGateways` 遇到 VPC API connection reset，资源未改变且凭据脱敏生效。`terraform apply` 与 `terraform destroy` 现增加最多 3 次、间隔 15 秒的有限重试；非瞬时错误在第三次后仍返回非零状态，destroy 未成功时仍保留 state 与 kubeconfig。
 - 最终 lifecycle 的一次人为中断发生在 destroy 已移除部分 state 后；按设计 state 与 kubeconfig 均保留并可续跑。该中断同时发现 Provider refresh 会重新生成 0644 kubeconfig，`kiall` 现增加 EXIT trap：只要文件仍存在，无论成功、失败、Ctrl-C 都恢复 0600；完整 destroy 成功后仍删除该文件。
 - 一次完整 fresh `kup` 的运行期检查全部通过且命令返回 0，但 Helm 最终清单显示 Cilium 与 Timescape 因 ACK API 在写最终 release Secret 时断线而停在 `pending-install`。`helm upgrade` 在该场景仍返回 0，单靠进程退出码不足。`kup` 现对每次 Helm 操作额外读取 release status 并强制要求 `deployed`；重试前仅删除最新的 `pending-*` revision Secret（包括没有稳定前序 revision 的 interrupted install），不删除 workload 或任何 deployed revision。
+- 2026-09-14 再次从部分 state 收敛时，Alibaba Cloud 以 `InvalidAccountStatus.NotEnoughBalance` 拒绝按量付费 Worker Node Pool 下单。只读 BSS 查询确认账户可用额度低于官方按量付费门槛；VPC、vSwitch 与 ACK 控制面仍在 state 中，失败的 Node Pool 未进入 state。该问题不能通过降低节点数/规格或切换计费类型正确修复。`kup` 现把余额不足、欠费/未支付订单、缺少支付方式和代理商额度不足识别为不可重试计费错误：第一次失败后立即给出恢复指令并保留 state；补足额度后重跑会只继续缺失的 Node Pool。不准备充值时应运行 `./kiall`，避免已创建资源继续计费。真实余额不足回归确认 `kup` 非零退出、没有第二次 apply、state 前后完全一致，且用于分类的 0600 临时脱敏日志已自动删除。
 
 ## Galileo application extension — 2026-09-13
 
@@ -199,6 +200,6 @@ re-run kup after transient/interrupted Helm metadata recovery
 
 Migration completed。正常路径已是 Mac-only `kup`/`kiall`，Cloud Shell、Integrated Timescape、独立 `tup`、全局 kube context 与 state 外 aggressive cleanup 都不在 baseline。`kup -> kup -> kiall -> kiall -> kup` 的真实基础设施生命周期已覆盖；Galileo 扩展也已完成真实部署、定向检查和完整 zero-diff `kup` 重跑，并额外验证中断销毁恢复、pending Helm revision 恢复。Roadmap 项未进入 baseline。
 
-没有已知的 migration 功能阻塞。Alibaba VPC/ACK API 在验证期间出现过短暂 connection reset/HTTP2 loss；有限重试、Helm `deployed` 门禁和幂等重跑已实测恢复，最终不再有 pending release。
+没有已知的 migration 功能阻塞。Alibaba VPC/ACK API 在验证期间出现过短暂 connection reset/HTTP2 loss；有限重试、Helm `deployed` 门禁和幂等重跑已实测恢复，最终不再有 pending release。当前这次重建仍受账号可用额度不足这一外部计费条件阻塞；代码已 fail-fast，但只有账号补足额度或恢复信控后才能继续创建 Worker。
 
 安全后续：在输出脱敏加入之前，Provider 的一次失败 URL 曾把本次验证所用 RAM AccessKey ID（没有 Secret/password）写入本地任务 transcript。虽然签名参数已过期，仍建议验证后轮换该 RAM AccessKey pair；文档和 tracked 文件中没有写入该值。

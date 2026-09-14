@@ -250,19 +250,38 @@ run_terraform() {
   terraform "$@" 2>&1 | redact_secrets
 }
 
-terraform_apply() {
-  local attempt
+terraform_apply() (
+  local attempt apply_log apply_status
+  umask 077
+  apply_log="$(mktemp "${RUNTIME_DIR}/terraform-apply.XXXXXX")"
+  trap 'rm -f -- "${apply_log}"' EXIT
+
   for ((attempt = 1; attempt <= 3; attempt++)); do
-    if run_terraform apply -auto-approve -input=false; then
+    if run_terraform apply -auto-approve -input=false | tee "${apply_log}"; then
       return 0
+    else
+      apply_status=$?
+    fi
+
+    if grep -Fq 'InvalidAccountStatus.NotEnoughBalance' "${apply_log}"; then
+      die "Alibaba Cloud rejected the PostPaid Worker order because the account has insufficient available balance. Restore the account's available balance/credit to the Alibaba Cloud PostPaid threshold (the official error-code guidance currently specifies at least CNY 100), settle any overdue bill, then rerun ./kup. Terraform state is preserved and the next run will continue with the missing Node Pool."
+    fi
+    if grep -Eq 'Account\.Arrearage|InvalidInstance\.UnPaidOrder' "${apply_log}"; then
+      die "Alibaba Cloud rejected the order because the account has an overdue or unpaid bill. Settle it in Expenses and Costs, then rerun ./kup; Terraform state is preserved."
+    fi
+    if grep -Eq 'PaymentMethodNotFound|InvalidPayMethod' "${apply_log}"; then
+      die "Alibaba Cloud rejected the order because the account has no usable payment method. Configure one in Expenses and Costs, then rerun ./kup; Terraform state is preserved."
+    fi
+    if grep -Fq 'InsufficientBalance.AgentCredit' "${apply_log}"; then
+      die "Alibaba Cloud reported insufficient reseller/agent credit. Contact the account's channel partner, then rerun ./kup; Terraform state is preserved."
     fi
     if (( attempt == 3 )); then
-      return 1
+      return "${apply_status}"
     fi
     log "Terraform apply attempt ${attempt} failed; retry in 15 seconds"
     sleep 15
   done
-}
+)
 
 render_template() {
   local input_file="$1"
