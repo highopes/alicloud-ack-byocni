@@ -69,8 +69,8 @@ GALILEO_PINECONE_TEXT_FIELD="chunk_text"
 GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS="Action Advancement - Qwen,Action Completion - Qwen,Tool Errors - Qwen,Tool Selection Quality - Qwen"
 GALILEO_SPLUNK_AO_EXPERIMENT_DATASET=""
 GALILEO_SUPERVISOR_PROMPT_PROFILE="baseline"
-# Which baseline kup leaves active: qwen hot-loads the bundled custom patch;
-# official keeps the immutable image's built-in GPT-oriented baseline.
+# Which baseline kup leaves active through the upstream switch_prompt.sh:
+# qwen => custom app/prompts/supervisor-baseline-qwen.txt; official => baseline.
 GALILEO_BASELINE_PROMPT_VARIANT="qwen"
 GALILEO_PROMPT_SYNC_TIMEOUT_SEC="300"
 GALILEO_LOCAL_PORT="8000"

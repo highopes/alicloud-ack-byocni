@@ -17,4 +17,5 @@ crash.*.log
 
 # Rendered Helm values/manifests and temporary logs
 runtime/
+.runtime/
 *.log

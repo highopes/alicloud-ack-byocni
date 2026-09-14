@@ -112,9 +112,9 @@ GALILEO_APP_MODEL_API_KEY        当前应用模型的 API key
 GALILEO_PINECONE_API_KEY         Pinecone API key
 ```
 
-`GALILEO_SUPERVISOR_PROMPT_PROFILE` 控制 `kup` 安装后进入 baseline 演示还是直接进入 improved，取值为 `baseline`（默认）或 `improved`。当它是 `baseline` 时，新变量 `GALILEO_BASELINE_PROMPT_VARIANT` 决定采用哪套 baseline：默认 `qwen` 会把仓库内的 Qwen 专用 baseline 以 `custom` ConfigMap 热补丁加载；`official` 则保留当前不可变镜像内更适合 GPT 类模型的官方 baseline。若 profile 是 `improved`，baseline variant 不生效。`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 是等待 projected ConfigMap 被 kubelet 刷新并被应用 resolver 读到的墙钟时间上限，默认 300 秒。
+`GALILEO_SUPERVISOR_PROMPT_PROFILE` 控制 `kup` 安装后进入 baseline 演示还是直接进入 improved，取值为 `baseline`（默认）或 `improved`。当它是 `baseline` 时，新变量 `GALILEO_BASELINE_PROMPT_VARIANT` 决定采用哪套 baseline：默认 `qwen` 等价于执行上游命令 `custom app/prompts/supervisor-baseline-qwen.txt`；`official` 等价于执行上游命令 `baseline`。若 profile 是 `improved`，baseline variant 不生效，`kup` 执行上游的 `improved`。该变量只是 `kup` 完成安装时选择哪条上游命令，不定义任何新的运行时 profile。`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 是 `kup` 等待 projected ConfigMap 被应用 resolver 读到的最终复核上限，默认 300 秒。
 
-本次验证的私有 `kup.conf` 已从同级 Galileo working copy 的 `.secrets` 与 `.runtime` resolved files 初始化：应用使用百炼 `qwen3.7-flash`、隔离 Pinecone index `credit-card-information-qwen-demo`，镜像仍固定为上游 commit `26ea7c0c3276cde94b6f5c1bff2b0d741d655858` 对应的 ACR digest。上游 commit `4ce9a4d24adc3bf91783cd68383a79b63e46cad4` 只提供新的 Qwen baseline 文本，本仓库将该文本保存为 `ns_galileo/supervisor-baseline-qwen.txt` 并动态加载，因此没有更换镜像。`kup` 不需要 Docker，也不会重新 build/push 镜像。真正更新应用镜像时，应先在 Galileo repo 重新完成 build、push 和 smoke，再一起更新 `GALILEO_SOURCE_COMMIT` 与 `GALILEO_IMAGE_REF`，禁止使用 `latest`。
+本次验证的私有 `kup.conf` 已从同级 Galileo working copy 的 `.secrets` 与 `.runtime` resolved files 初始化：应用使用百炼 `qwen3.7-flash`、隔离 Pinecone index `credit-card-information-qwen-demo`，镜像仍固定为上游 commit `26ea7c0c3276cde94b6f5c1bff2b0d741d655858` 对应的 ACR digest。上游 commit `4ce9a4d24adc3bf91783cd68383a79b63e46cad4` 没有要求更换当前镜像；本仓库把 Qwen baseline 保存在与上游相同的 `app/prompts/supervisor-baseline-qwen.txt`，并使用同一份 `scripts/switch_prompt.sh` 动态加载。`kup` 不需要 Docker，也不会重新 build/push 镜像。真正更新应用镜像时，应先在 Galileo repo 重新完成 build、push 和 smoke，再一起更新 `GALILEO_SOURCE_COMMIT` 与 `GALILEO_IMAGE_REF`，禁止使用 `latest`。
 
 运行期 Pod 只注入 Splunk AO、最终 application model 与 Pinecone 三个 key；VLLM Judge key、Docker Hub PAT、RAM AccessKey 和 ACR push credential 不会进入应用 Pod。若要展示四个 Qwen Evaluator 或 Experiment，需预先在 Splunk AO UI 中确认 Project、Agent Stream、Evaluator 与 Dataset；`kup` 不修改这些控制面对象。
 
@@ -228,7 +228,8 @@ GALILEO_POD=$(kctl -n galileo-demo get pod \
 kctl -n galileo-demo exec "$GALILEO_POD" -- python pod_network_smoke.py
 kctl -n test exec "$TEST_POD" -- \
   curl -fsS http://splunk-ao-banking-qwen.galileo-demo.svc.cluster.local/ >/dev/null
-./galileo-prompt status
+KUBECONFIG_FILE="$PWD/kubeconfig" KUBE_CONTEXT="ack-byocni-demo" \
+  KUBE_NAMESPACE="galileo-demo" ./scripts/switch_prompt.sh status
 ```
 
 ## Hubble UI access
@@ -253,7 +254,19 @@ kubectl \
   port-forward svc/splunk-ao-banking-qwen 8000:80
 ```
 
-打开 <http://127.0.0.1:8000>。这是 Galileo repo 的 Chainlit/LangGraph Multi-agent banking chatbot；Service 保持 ClusterIP，不创建 Ingress 或公网 LoadBalancer。另开一个终端运行 `./galileo-prompt status`，确认 ConfigMap、挂载文件和应用 resolver 三处 profile 一致。默认 Qwen baseline 在应用内部使用 `custom` profile，状态输出会进一步把对应内容哈希识别为 `qwen-baseline (custom hot patch)`。
+打开 <http://127.0.0.1:8000>。这是 Galileo repo 的 Chainlit/LangGraph Multi-agent banking chatbot；Service 保持 ClusterIP，不创建 Ingress 或公网 LoadBalancer。
+
+ACK 项目直接使用与 Galileo 上游逐字节一致的 `scripts/switch_prompt.sh` 和 `scripts/render_prompt_patch.py`。在本仓库操作前只需向上游脚本提供同一个集群的显式连接参数：
+
+```bash
+export KUBECONFIG_FILE="$PWD/kubeconfig"
+export KUBE_CONTEXT="ack-byocni-demo"
+export KUBE_NAMESPACE="galileo-demo"
+```
+
+这三个变量是上游脚本原生支持的通用 Kubernetes 接口，不会引入第二套状态或命令。运行 `./scripts/switch_prompt.sh status` 可核对 ConfigMap、挂载文件、应用 resolver、Prompt SHA-256 与 Deployment 镜像。
+
+两个 repository 没有各自保存一份“当前提示词状态”。唯一运行时事实来源始终是同一个 `galileo-demo/splunk-ao-banking-qwen-config` ConfigMap；在任一 repository 中执行切换，另一个 repository 的 `status` 会立即观察到同一结果。只有再次执行 `kup` 时，才会按 `kup.conf` 的安装后目标状态调用同一上游脚本重新收敛。
 
 ### 三套演示提示词与切换
 
@@ -261,19 +274,19 @@ kubectl \
 
 | 演示提示词 | 切换命令 | 应用 profile / Session 标签 | 用途 |
 |---|---|---|---|
-| 官方 baseline | `./galileo-prompt official-baseline` | `baseline` / `[baseline]` | 官方故意不完整版本，更适合 GPT 类模型；`baseline` 是此命令的兼容别名 |
-| Qwen baseline | `./galileo-prompt qwen-baseline` | `custom` / `[custom]` | 针对 Qwen 构造的故障版；这是 `kup.conf.example` 和当前私有配置的默认值 |
-| improved | `./galileo-prompt improved` | `improved` / `[improved]` | 明确支持 credit-score agent，并正确交付工具结果 |
+| 官方 baseline | `./scripts/switch_prompt.sh baseline` | `baseline` / `[baseline]` | 当前镜像内置的官方故意不完整版本，更适合 GPT 类模型 |
+| Qwen baseline | `./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt` | `custom` / `[custom]` | 针对 Qwen 构造的故障版；这是 `kup.conf.example` 和当前私有配置的默认值 |
+| improved | `./scripts/switch_prompt.sh improved` | `improved` / `[improved]` | 明确支持 credit-score agent，并正确交付工具结果 |
 
-每条切换命令都会等待 ConfigMap 投影和应用 resolver 收敛，并核对 Pod UID、restart count 与 image ID 没有变化。切换完成后必须在 Chainlit 中**新建聊天**；已开始的聊天继续使用创建 Session 时的 prompt。
+这与上游完全采用同一套 `baseline | improved | custom FILE` 状态模型，没有额外 alias。脚本会等待 ConfigMap 投影和应用 resolver 收敛；`custom` 还会校验实际 Prompt SHA-256。升级后的 Deployment 只做热更新，不重启 Pod；只有检测到未挂载 projected ConfigMap 的旧 Deployment 时，才按上游兼容逻辑滚动一次。切换完成后必须在 Chainlit 中**新建聊天**；已开始的聊天继续使用创建 Session 时的 prompt。
 
 ### 第一阶段：Qwen baseline 故障演示
 
 `kup` 默认以 `GALILEO_SUPERVISOR_PROMPT_PROFILE="baseline"` 和 `GALILEO_BASELINE_PROMPT_VARIANT="qwen"` 结束安装，也可以在演示前显式恢复同一状态：
 
 ```bash
-./galileo-prompt qwen-baseline
-./galileo-prompt status
+./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
+./scripts/switch_prompt.sh status
 ```
 
 建议按以下顺序演示：
@@ -290,7 +303,7 @@ kubectl \
 不修改源码、镜像或 Pod，直接把 ConfigMap 切到上游内置的 `improved` profile：
 
 ```bash
-./galileo-prompt improved
+./scripts/switch_prompt.sh improved
 ```
 
 这个 profile 明确给 supervisor 增加 credit-score agent 能力描述并正确交付返回结果。新建聊天后重复 `What is my credit score?`，预期返回工具支持的 `550`。新 Splunk AO Session 名称包含 `[improved]`，可与 Qwen baseline 的 `[custom]` Trace/Evaluator 结果对比。
@@ -301,15 +314,15 @@ kubectl \
 
 ```bash
 # 使用仓库附带的生产化 routing contract 示例
-./galileo-prompt custom ./ns_galileo/supervisor-production-example.txt
+./scripts/switch_prompt.sh custom app/prompts/supervisor-production-example.txt
 
 # 或使用自己的文件
-./galileo-prompt custom /absolute/path/to/supervisor-prompt.txt
+./scripts/switch_prompt.sh custom /absolute/path/to/supervisor-prompt.txt
 ```
 
 切换完成后新建 Chainlit 聊天，Splunk AO Session 名称会包含 `[custom]`。自定义 prompt 保存在 ConfigMap 中，对有该 namespace 读取权限的人可见，因此不要在提示词中放密码、API key、客户隐私或其他 Secret。
 
-Kubernetes ConfigMap 投影是最终一致的；`./galileo-prompt` 默认按真实墙钟最多等待 300 秒，不需要手工重启 Pod。如果超时，命令会失败并保留诊断信息，不能把 ConfigMap 已修改误报成应用已生效。查看原始配置可执行：
+Kubernetes ConfigMap 投影是最终一致的；上游脚本按同样的 90 次、每次 2 秒方式等待，不需要手工重启 Pod。如果超时，命令会失败，不能把 ConfigMap 已修改误报成应用已生效。`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 只控制 `kup` 随后的最终一致性复核。查看原始配置可执行：
 
 ```bash
 kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo \
@@ -320,10 +333,10 @@ kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo \
 演示结束后恢复默认 Qwen baseline：
 
 ```bash
-./galileo-prompt qwen-baseline
+./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
 ```
 
-如需验证官方 baseline，可执行 `./galileo-prompt official-baseline`（或兼容别名 `./galileo-prompt baseline`）；这会清空 custom 内容并回到镜像内置文本。再次运行 `./kup` 会恢复私有配置指定的 profile 和 baseline variant，默认重新热加载 Qwen baseline，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
+如需验证官方 baseline，执行 `./scripts/switch_prompt.sh baseline`；这会清空 custom 内容并回到镜像内置文本。再次运行 `./kup` 会通过同一上游脚本恢复私有配置指定的 profile 和 baseline variant，默认重新热加载 Qwen baseline，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
 
 ## Destroy
 
@@ -399,7 +412,7 @@ mini-boutique 与 testcurl 已使用 Alibaba Registry 镜像。若仍失败，�
 
 ### Galileo prompt switch times out
 
-先运行 `./galileo-prompt status` 比较 ConfigMap、挂载文件和 resolver。确认 Deployment 包含 `/etc/banking-prompt` projected ConfigMap volume；旧部署缺少挂载时应重新运行 `./kup`，不要只 patch ConfigMap。正常投影可能需要接近 kubelet 同步周期，可在私有 `kup.conf` 适当增大 `GALILEO_PROMPT_SYNC_TIMEOUT_SEC`。脚本不会通过重启 Pod 掩盖热更新失败。
+先按上文导出三个显式集群变量，再运行 `./scripts/switch_prompt.sh status` 比较 ConfigMap、挂载文件和 resolver。确认 Deployment 包含 `/etc/banking-prompt` projected ConfigMap volume；旧部署缺少挂载时，上游脚本会兼容性滚动应用 Pod，或可重新运行 `./kup`。正常投影可能需要接近 kubelet 同步周期；`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 只影响 `kup` 的最终复核，不改变上游切换脚本的等待策略。
 
 ### Interrupted kup
 

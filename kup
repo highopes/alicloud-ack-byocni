@@ -82,8 +82,9 @@ for required_file in \
   cilium-enterprise-values.yaml hubble-enterprise-values.yaml hubble-timescape-values.yaml \
   hubble-ui-values.yaml tetragon.yaml tpr-values.yaml ns_test/testcurl.yaml \
   ns_demo/mini-boutique-lite.yaml ns_demo/cnp-l7-visibility.yaml \
-  ns_galileo/multi-agent-banking.yaml ns_galileo/supervisor-production-example.txt \
-  ns_galileo/supervisor-baseline-qwen.txt galileo-prompt; do
+  ns_galileo/multi-agent-banking.yaml app/prompts/supervisor-production-example.txt \
+  app/prompts/supervisor-baseline-qwen.txt scripts/switch_prompt.sh \
+  scripts/render_prompt_patch.py; do
   [[ -f "${SCRIPT_DIR}/${required_file}" ]] || die "required file not found: ${SCRIPT_DIR}/${required_file}"
 done
 
@@ -119,7 +120,7 @@ case "${GALILEO_APP_MODEL_PROVIDER}" in
 esac
 case "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" in
   baseline|improved) ;;
-  *) die "GALILEO_SUPERVISOR_PROMPT_PROFILE must be baseline or improved; use ./galileo-prompt for custom prompts" ;;
+  *) die "GALILEO_SUPERVISOR_PROMPT_PROFILE must be baseline or improved; use ./scripts/switch_prompt.sh for custom prompts" ;;
 esac
 case "${GALILEO_BASELINE_PROMPT_VARIANT}" in
   official|qwen) ;;
@@ -136,7 +137,7 @@ for secret_name in \
 done
 unset secret_name secret_value
 
-mkdir -p "${RUNTIME_DIR}"
+mkdir -p "${RUNTIME_DIR}" "${SCRIPT_DIR}/.runtime"
 cd "${WORKDIR}"
 
 export ALICLOUD_ACCESS_KEY ALICLOUD_SECRET_KEY
@@ -514,7 +515,7 @@ validate_galileo_prompt_runtime() {
   if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
     "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
     expected_profile="custom"
-    expected_custom_hash="$(python3 - "${SCRIPT_DIR}/ns_galileo/supervisor-baseline-qwen.txt" <<'PY'
+    expected_custom_hash="$(python3 - "${SCRIPT_DIR}/app/prompts/supervisor-baseline-qwen.txt" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
@@ -587,15 +588,22 @@ print(data.get("SUPERVISOR_PROMPT_PROFILE", "") + "\t" + digest)
 }
 
 apply_galileo_initial_prompt() {
+  local -a prompt_args
   if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
     "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
     log "hot-load the Qwen baseline through the Galileo custom prompt ConfigMap"
-    KUP_CONFIG="${CONFIG_FILE}" "${SCRIPT_DIR}/galileo-prompt" qwen-baseline
+    prompt_args=(custom "${SCRIPT_DIR}/app/prompts/supervisor-baseline-qwen.txt")
   elif [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" ]]; then
     log "keep the immutable image's official baseline prompt"
+    prompt_args=(baseline)
   else
     log "keep the configured Galileo ${GALILEO_SUPERVISOR_PROMPT_PROFILE} prompt profile"
+    prompt_args=(improved)
   fi
+  KUBECONFIG_FILE="${KUBECONFIG_FILE}" \
+    KUBE_CONTEXT="${ACK_CONTEXT}" \
+    KUBE_NAMESPACE="${GALILEO_NAMESPACE}" \
+    "${SCRIPT_DIR}/scripts/switch_prompt.sh" "${prompt_args[@]}"
 }
 
 validate_galileo_runtime() {
@@ -725,7 +733,9 @@ helm version --short
 log "preflight: static syntax and Terraform format"
 bash -n "${SCRIPT_DIR}/kup"
 bash -n "${SCRIPT_DIR}/kiall"
-bash -n "${SCRIPT_DIR}/galileo-prompt"
+bash -n "${SCRIPT_DIR}/scripts/switch_prompt.sh"
+python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
+  "${SCRIPT_DIR}/scripts/render_prompt_patch.py"
 terraform fmt -check "${WORKDIR}"
 
 log "configure private Isovalent Helm repository"
@@ -875,7 +885,7 @@ kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" \\
 kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" \\
   -n "${GALILEO_NAMESPACE}" port-forward svc/splunk-ao-banking-qwen "${GALILEO_LOCAL_PORT}:80"
 # Open http://127.0.0.1:${GALILEO_LOCAL_PORT}
-# Prompt demo: ${SCRIPT_DIR}/galileo-prompt status|official-baseline|qwen-baseline|improved|custom [prompt-file]
+# Prompt demo: ${SCRIPT_DIR}/scripts/switch_prompt.sh status|baseline|improved|custom [prompt-file]
 
 # ACK and Cilium
 kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}" get nodes -o wide
