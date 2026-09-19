@@ -279,7 +279,7 @@ kubectl \
 
 打开 <http://127.0.0.1:8000>。这是 Galileo repo 的 Chainlit/LangGraph Multi-agent banking chatbot；Service 保持 ClusterIP，不创建 Ingress 或公网 LoadBalancer。
 
-ACK 项目直接使用与 Galileo 上游逐字节一致的 `scripts/switch_prompt.sh` 和 `scripts/render_prompt_patch.py`。在本仓库操作前只需向上游脚本提供同一个集群的显式连接参数：
+ACK 项目的 `scripts/switch_prompt.sh` 默认从 `kup.conf` 读取项目 kubeconfig、ACK context 与 Galileo namespace，因此可在仓库根目录直接运行。需要指向其他集群时，也可以显式覆盖连接参数：
 
 ```bash
 export KUBECONFIG_FILE="$PWD/kubeconfig"
