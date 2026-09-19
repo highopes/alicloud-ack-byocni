@@ -7,6 +7,18 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; 
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${KUP_CONFIG:-${SCRIPT_DIR}/kup.conf}"
+KUP_MODE="full"
+
+case "${1:-}" in
+  "") ;;
+  --galileo-only) KUP_MODE="galileo-only" ;;
+  -h|--help)
+    printf 'usage: %s [--galileo-only]\n' "$0"
+    exit 0
+    ;;
+  *) die "unknown argument: $1; usage: $0 [--galileo-only]" ;;
+esac
+[[ "$#" -le 1 ]] || die "too many arguments; usage: $0 [--galileo-only]"
 
 [[ -f "${CONFIG_FILE}" ]] || die "private config not found: ${CONFIG_FILE}; copy kup.conf.example to kup.conf first"
 chmod 600 "${CONFIG_FILE}"
@@ -310,6 +322,65 @@ with open(source, "r", encoding="utf-8") as handle:
 with open(destination, "w", encoding="utf-8") as handle:
     handle.write(rendered)
 PY
+}
+
+render_galileo_manifest() {
+  local output_file="$1"
+  local rendered_prompt_profile rendered_prompt_file
+
+  # These values are consumed through envFrom and are read only when a Pod
+  # starts. Keeping their checksum on the Pod template makes kubectl apply
+  # trigger exactly one Galileo rollout when any of them changes. Prompt
+  # profile/content is deliberately excluded because it is hot-loaded from
+  # the projected ConfigMap by scripts/switch_prompt.sh.
+  export GALILEO_POD_INPUTS_CHECKSUM
+  GALILEO_POD_INPUTS_CHECKSUM="$(python3 - <<'PY'
+import hashlib
+import json
+import os
+
+names = (
+    "GALILEO_SPLUNK_AO_API_KEY",
+    "GALILEO_SPLUNK_AO_PROJECT",
+    "GALILEO_SPLUNK_AO_AGENT_STREAM",
+    "GALILEO_SPLUNK_AO_CONSOLE_URL",
+    "GALILEO_APP_MODEL_PROVIDER",
+    "GALILEO_APP_MODEL_NAME",
+    "GALILEO_APP_MODEL_BASE_URL",
+    "GALILEO_APP_MODEL_API_KEY",
+    "GALILEO_MODEL_REQUEST_TIMEOUT",
+    "GALILEO_MODEL_MAX_RETRIES",
+    "GALILEO_PINECONE_API_KEY",
+    "GALILEO_PINECONE_INDEX_NAME",
+    "GALILEO_PINECONE_NAMESPACE",
+    "GALILEO_PINECONE_TEXT_FIELD",
+    "GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS",
+    "GALILEO_SPLUNK_AO_EXPERIMENT_DATASET",
+)
+payload = {name: os.environ[name] for name in names}
+encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(encoded).hexdigest())
+PY
+)"
+
+  rendered_prompt_profile="${GALILEO_SUPERVISOR_PROMPT_PROFILE}"
+  rendered_prompt_file=""
+  if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
+    "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
+    rendered_prompt_profile="custom"
+    rendered_prompt_file="${SCRIPT_DIR}/app/prompts/supervisor-baseline-qwen.txt"
+  fi
+  export GALILEO_RENDERED_PROMPT_PROFILE_JSON GALILEO_RENDERED_PROMPT_CUSTOM_JSON
+  GALILEO_RENDERED_PROMPT_PROFILE_JSON="$(python3 -c \
+    'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' \
+    "${rendered_prompt_profile}")"
+  GALILEO_RENDERED_PROMPT_CUSTOM_JSON="$(python3 -c \
+    'import json,pathlib,sys; print(json.dumps(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip(), ensure_ascii=False) if sys.argv[1] else json.dumps(""))' \
+    "${rendered_prompt_file}")"
+
+  render_template "${SCRIPT_DIR}/ns_galileo/multi-agent-banking.yaml" "${output_file}"
+  unset GALILEO_POD_INPUTS_CHECKSUM GALILEO_RENDERED_PROMPT_PROFILE_JSON
+  unset GALILEO_RENDERED_PROMPT_CUSTOM_JSON
 }
 
 normalize_context() {
@@ -725,6 +796,36 @@ validate_hubble_timescape_pipeline() {
   die "Hubble Enterprise to Timescape historical flow pipeline did not become active"
 }
 
+if [[ "${KUP_MODE}" == "galileo-only" ]]; then
+  log "preflight: Galileo-only reconciliation"
+  kubectl version --client
+  bash -n "${SCRIPT_DIR}/kup"
+  bash -n "${SCRIPT_DIR}/scripts/switch_prompt.sh"
+  python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
+    "${SCRIPT_DIR}/scripts/render_prompt_patch.py"
+
+  [[ -s "${KUBECONFIG_FILE}" ]] || die "project kubeconfig not found or empty: ${KUBECONFIG_FILE}; run ./kup first"
+  chmod 600 "${KUBECONFIG_FILE}"
+  wait_for_api
+
+  GALILEO_MANIFEST="${RUNTIME_DIR}/galileo-multi-agent-banking.yaml"
+  render_galileo_manifest "${GALILEO_MANIFEST}"
+
+  log "reconcile only the Galileo multi-agent banking chatbot"
+  ensure_namespace "${GALILEO_NAMESPACE}"
+  create_galileo_secrets
+  kctl apply -f "${GALILEO_MANIFEST}"
+  kctl -n "${GALILEO_NAMESPACE}" rollout status \
+    deployment/splunk-ao-banking-qwen --timeout=15m
+  kctl -n "${GALILEO_NAMESPACE}" wait --for=condition=Ready pod \
+    -l app.kubernetes.io/name=splunk-ao-banking-qwen --timeout=15m
+  apply_galileo_initial_prompt
+  validate_galileo_runtime
+  kctl -n "${GALILEO_NAMESPACE}" get deployment,pods,service -o wide
+  log "SUCCESS: Galileo banking chatbot reconciled; ACK infrastructure and platform add-ons were not changed"
+  exit 0
+fi
+
 log "preflight: local tool versions"
 terraform version
 kubectl version --client
@@ -753,7 +854,7 @@ GALILEO_MANIFEST="${RUNTIME_DIR}/galileo-multi-agent-banking.yaml"
 render_template "${SCRIPT_DIR}/cilium-enterprise-values.yaml" "${CILIUM_VALUES}"
 render_template "${SCRIPT_DIR}/tetragon.yaml" "${TETRAGON_VALUES}"
 render_template "${SCRIPT_DIR}/tpr-values.yaml" "${TPR_VALUES}"
-render_template "${SCRIPT_DIR}/ns_galileo/multi-agent-banking.yaml" "${GALILEO_MANIFEST}"
+render_galileo_manifest "${GALILEO_MANIFEST}"
 
 validate_chart cilium isovalent/cilium "${CILIUM_CHART_VER}" "${CILIUM_VALUES}"
 validate_chart hubble-ui isovalent/hubble-ui "${HUBBLE_UI_CHART_VER}" "${SCRIPT_DIR}/hubble-ui-values.yaml"

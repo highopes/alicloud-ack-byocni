@@ -157,6 +157,29 @@ context: ack-byocni-demo
 
 所有 Kubernetes/Helm 操作显式指定该文件和 context，不读取或改变全局 current-context，因此不会影响同一台 Mac 上的 AWS EKS context。
 
+## Apply Galileo configuration changes
+
+集群已经由 `./kup` 完整部署后，如果只修改了私有 `kup.conf` 中的 `GALILEO_*` 或 Multi-Agent Banking Chatbot 参数，不要为了让应用读取新值而重新执行完整部署。运行：
+
+```bash
+./kup --galileo-only
+```
+
+这个模式只收敛 `galileo-demo` namespace 中的两个 Secret、ConfigMap、Service 和 `splunk-ao-banking-qwen` Deployment；它不会运行 Terraform，也不会升级或重启 ACK Node、Cilium、Hubble、Timescape、Tetragon、mini-boutique 或 testcurl。
+
+不同参数的生效方式如下：
+
+| `kup.conf` 修改类型 | 生效方式 | 影响范围 |
+|---|---|---|
+| `GALILEO_SPLUNK_AO_API_KEY`、应用模型/Pinecone key，以及由环境变量读取的 Project、Agent Stream、模型、index、Evaluator/Dataset 等运行时参数 | `./kup --galileo-only` 更新 Secret/ConfigMap；Pod 模板校验和变化后自动滚动 | 只替换 Chatbot 的一个 Pod；RollingUpdate 会先创建新 Pod，再移除旧 Pod |
+| `GALILEO_IMAGE_REF`、`GALILEO_SOURCE_COMMIT` | `./kup --galileo-only` 应用新的不可变镜像与来源标记 | 只滚动 Chatbot Deployment |
+| ACR pull 用户名或密码 | `./kup --galileo-only` 更新 imagePullSecret；若镜像未变，现有 Pod 无需重启 | 只影响以后拉取 Chatbot 镜像 |
+| `GALILEO_SUPERVISOR_PROMPT_PROFILE`、`GALILEO_BASELINE_PROMPT_VARIANT` | `./kup --galileo-only` 使用现有 projected ConfigMap 热加载 | Pod 与镜像保持不变；新建 Chainlit 聊天后使用新提示词 |
+| 只临时切换 baseline/improved/custom prompt | 直接运行下文的 `./scripts/switch_prompt.sh ...`，无需修改 `kup.conf` | 不重启 Pod |
+| `GALILEO_LOCAL_PORT`、`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` | 下次本地 port-forward 或收敛命令直接读取 | 不修改集群工作负载 |
+
+Secret 和通过 `envFrom` 注入的 ConfigMap 值只会在 Pod 启动时读取；只编辑 `kup.conf` 或只更新 Kubernetes Secret，不会改变已经运行的进程。因此不要省略上述 Galileo-only 收敛。命令结束前会等待 rollout 完成，并在新 Pod 内验证 prompt、HTTP、精确模型 ID、Pinecone 查询和 Splunk AO HTTPS；失败时返回非零状态。若修改 `GALILEO_NAMESPACE`，该命令会在新 namespace 部署一套应用，但不会猜测并删除旧 namespace，需把它视为迁移而不是普通参数刷新。
+
 ## Validate
 
 先定义一个便于复制的只读 wrapper：
@@ -266,7 +289,7 @@ export KUBE_NAMESPACE="galileo-demo"
 
 这三个变量是上游脚本原生支持的通用 Kubernetes 接口，不会引入第二套状态或命令。运行 `./scripts/switch_prompt.sh status` 可核对 ConfigMap、挂载文件、应用 resolver、Prompt SHA-256 与 Deployment 镜像。
 
-两个 repository 没有各自保存一份“当前提示词状态”。唯一运行时事实来源始终是同一个 `galileo-demo/splunk-ao-banking-qwen-config` ConfigMap；在任一 repository 中执行切换，另一个 repository 的 `status` 会立即观察到同一结果。只有再次执行 `kup` 时，才会按 `kup.conf` 的安装后目标状态调用同一上游脚本重新收敛。
+两个 repository 没有各自保存一份“当前提示词状态”。唯一运行时事实来源始终是同一个 `galileo-demo/splunk-ao-banking-qwen-config` ConfigMap；在任一 repository 中执行切换，另一个 repository 的 `status` 会立即观察到同一结果。再次执行 `./kup --galileo-only`（或完整的 `./kup`）时，会按 `kup.conf` 的目标状态调用同一上游脚本重新收敛。
 
 ### 三套演示提示词与切换
 
@@ -336,7 +359,7 @@ kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo \
 ./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
 ```
 
-如需验证官方 baseline，执行 `./scripts/switch_prompt.sh baseline`；这会清空 custom 内容并回到镜像内置文本。再次运行 `./kup` 会通过同一上游脚本恢复私有配置指定的 profile 和 baseline variant，默认重新热加载 Qwen baseline，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
+如需验证官方 baseline，执行 `./scripts/switch_prompt.sh baseline`；这会清空 custom 内容并回到镜像内置文本。再次运行 `./kup --galileo-only`（或完整的 `./kup`）会通过同一上游脚本恢复私有配置指定的 profile 和 baseline variant，默认重新热加载 Qwen baseline，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
 
 ## Destroy
 
@@ -408,7 +431,7 @@ mini-boutique 与 testcurl 已使用 Alibaba Registry 镜像。若仍失败，�
 
 ### Galileo model, Pinecone, or Splunk AO check fails
 
-`kup` 会在应用 Pod 内运行上游 `pod_network_smoke.py`。模型检查要求 HTTPS `/models` 可认证访问且返回精确 `GALILEO_APP_MODEL_NAME`；Pinecone 检查要求隔离 index/namespace 对 Orbit 查询至少返回一个 hit；Splunk AO console 必须能建立 HTTPS 连接。修复 `kup.conf` 中对应 endpoint/key 或外部服务状态后重跑 `./kup`，不要跳过该硬检查。
+`kup` 会在应用 Pod 内运行上游 `pod_network_smoke.py`。模型检查要求 HTTPS `/models` 可认证访问且返回精确 `GALILEO_APP_MODEL_NAME`；Pinecone 检查要求隔离 index/namespace 对 Orbit 查询至少返回一个 hit；Splunk AO console 必须能建立 HTTPS 连接。修复 `kup.conf` 中对应 endpoint/key 或外部服务状态后运行 `./kup --galileo-only`；只有平台组件也需要重新收敛时才运行完整的 `./kup`，不要跳过该硬检查。
 
 ### Galileo prompt switch times out
 
