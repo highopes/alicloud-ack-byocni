@@ -268,7 +268,9 @@ from splunk_ao.deployment import DeploymentMode, StandaloneConfig, resolve_deplo
 
 DATASET_NAME = "Banking CN Model Economics"
 EXPERIMENT_GROUP = "Banking CN Model Economics"
-DATASET_CONTENT = [
+# Used only when the named Dataset does not exist. Once it exists, the Dataset
+# currently stored in Splunk AO is authoritative, including UI edits.
+DEFAULT_DATASET_CONTENT = [
     {
         "input": "Orbit信用卡提供哪些返现奖励？",
         "output": "Orbit Basic 信用卡不提供任何返现、积分或里程奖励，也没有奖励计划。",
@@ -373,51 +375,49 @@ from src.splunk_ao_langgraph_fsi_agent.config import get_settings  # noqa: E402
 from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt  # noqa: E402
 
 
-def validate_dataset(dataset: Any) -> None:
-    content = dataset.get_content(limit=100)
+def read_dataset_rows(dataset: Any) -> list[dict[str, str]]:
+    content = dataset.get_content()
     rows = [] if content is None else list(content.rows or [])
-    if len(rows) != len(DATASET_CONTENT):
-        raise RuntimeError(
-            f"existing Dataset {DATASET_NAME!r} has {len(rows)} rows, expected {len(DATASET_CONTENT)}; "
-            "it was not modified"
-        )
+    if not rows:
+        raise RuntimeError(f"Dataset {DATASET_NAME!r} is empty; it was not modified")
 
-    actual: dict[str, str] = {}
-    for row in rows:
+    normalized: list[dict[str, str]] = []
+    seen_inputs: set[str] = set()
+    for index, row in enumerate(rows, start=1):
         values = row.values_dict.to_dict()
         input_value = values.get("input")
         output_value = values.get("output")
         if output_value is None:
             output_value = values.get("ground_truth")
-        if not isinstance(input_value, str) or not isinstance(output_value, str):
+        if (
+            not isinstance(input_value, str)
+            or not input_value.strip()
+            or not isinstance(output_value, str)
+            or not output_value.strip()
+        ):
             raise RuntimeError(
-                f"existing Dataset {DATASET_NAME!r} does not use the required input/output schema; "
-                "it was not modified"
+                f"Dataset {DATASET_NAME!r} row {index} must contain non-empty input and "
+                "output/Ground Truth strings; it was not modified"
             )
-        if input_value in actual:
-            raise RuntimeError(f"existing Dataset {DATASET_NAME!r} contains duplicate inputs; it was not modified")
-        actual[input_value] = output_value
-
-    expected = {row["input"]: row["output"] for row in DATASET_CONTENT}
-    if actual != expected:
-        raise RuntimeError(
-            f"existing Dataset {DATASET_NAME!r} differs from the reviewed six-row Ground Truth fixture; "
-            "it was not modified"
-        )
+        if input_value in seen_inputs:
+            raise RuntimeError(f"Dataset {DATASET_NAME!r} contains duplicate inputs; it was not modified")
+        seen_inputs.add(input_value)
+        normalized.append({"input": input_value, "output": output_value})
+    return normalized
 
 
-def ensure_dataset(project: str) -> tuple[Any, str]:
+def ensure_dataset(project: str) -> tuple[Any, str, list[dict[str, str]]]:
     dataset = get_dataset(name=DATASET_NAME, project_name=project)
     if dataset is not None:
-        validate_dataset(dataset)
-        return dataset, "existing, reusing 6 rows"
+        dataset_rows = read_dataset_rows(dataset)
+        return dataset, f"existing, reusing {len(dataset_rows)} UI rows", dataset_rows
 
-    create_dataset(name=DATASET_NAME, content=DATASET_CONTENT, project_name=project)
+    create_dataset(name=DATASET_NAME, content=DEFAULT_DATASET_CONTENT, project_name=project)
     for _ in range(5):
         dataset = get_dataset(name=DATASET_NAME, project_name=project)
         if dataset is not None:
-            validate_dataset(dataset)
-            return dataset, "created, verified 6 rows"
+            dataset_rows = read_dataset_rows(dataset)
+            return dataset, f"created from local defaults, verified {len(dataset_rows)} rows", dataset_rows
         time.sleep(2)
     raise RuntimeError(f"Dataset {DATASET_NAME!r} was created but could not be read back")
 
@@ -623,7 +623,8 @@ def wait_for_native_spans(rows: list[dict[str, Any]]) -> None:
             )
             print(
                 f"Native trace ingest stable: {span_count} Spans, "
-                f"{token_span_count} token-bearing LLM Spans across 6/6 roots."
+                f"{token_span_count} token-bearing LLM Spans across "
+                f"{len(expected_ids)}/{len(expected_ids)} roots."
             )
             return
 
@@ -636,8 +637,13 @@ def wait_for_native_spans(rows: list[dict[str, Any]]) -> None:
     )
 
 
-def verify_experiment_telemetry(project_id: str, experiment_id: str) -> None:
-    expected_ground_truth = {row["input"]: row["output"] for row in DATASET_CONTENT}
+def verify_experiment_telemetry(
+    project_id: str,
+    experiment_id: str,
+    dataset_rows: list[dict[str, str]],
+) -> None:
+    expected_ground_truth = {row["input"]: row["output"] for row in dataset_rows}
+    expected_count = len(dataset_rows)
     verification_deadline = time.monotonic() + 180
     last_issues: list[str] = ["Experiment records are not searchable yet"]
 
@@ -671,8 +677,8 @@ def verify_experiment_telemetry(project_id: str, experiment_id: str) -> None:
                 stored_spans[trace_id].append(values)
 
         issues: list[str] = []
-        if len(stored_traces) != len(DATASET_CONTENT):
-            issues.append(f"expected 6 root Traces, found {len(stored_traces)}")
+        if len(stored_traces) != expected_count:
+            issues.append(f"expected {expected_count} root Traces, found {len(stored_traces)}")
 
         seen_inputs: set[str] = set()
         for trace_id, root in stored_traces.items():
@@ -726,7 +732,7 @@ def verify_experiment_telemetry(project_id: str, experiment_id: str) -> None:
                 issues.append(f"Trace {trace_id} has no token-bearing successful LLM Span")
 
         if seen_inputs != set(expected_ground_truth):
-            issues.append("the six stored Trace inputs do not match the Dataset")
+            issues.append("the stored Trace inputs do not match the Dataset snapshot")
 
         if not issues:
             span_count = sum(len(items) for items in stored_spans.values())
@@ -737,7 +743,7 @@ def verify_experiment_telemetry(project_id: str, experiment_id: str) -> None:
                 if is_token_bearing_llm_span(span)
             )
             print(
-                f"Trace verification: 6/6 roots, {span_count} Spans, "
+                f"Trace verification: {expected_count}/{expected_count} roots, {span_count} Spans, "
                 f"{llm_span_count} token-bearing LLM Spans; Ground Truth, outputs, "
                 "root Cost/Tokens/Latency complete."
             )
@@ -792,7 +798,8 @@ def main() -> int:
         )
     evaluator_ids, evaluator_names = resolve_ground_truth_evaluator(configured_evaluator_names)
 
-    dataset, dataset_status = ensure_dataset(project)
+    dataset, dataset_status, dataset_rows = ensure_dataset(project)
+    dataset_row_count = len(dataset_rows)
     print(f"Dataset: {DATASET_NAME}")
     print(f"Dataset status: {dataset_status}")
     if LEGACY_HOSTED_GALILEO:
@@ -843,7 +850,7 @@ def main() -> int:
                     raise RuntimeError("banking agent returned an empty response")
                 root_record.update(output=output, duration_ns=time.perf_counter_ns() - started_ns)
                 completed_rows.append(root_record)
-                print(f"Scenario completed: {len(completed_rows)}/{len(DATASET_CONTENT)}", flush=True)
+                print(f"Scenario completed: {len(completed_rows)}/{dataset_row_count}", flush=True)
                 return output
             except Exception as exc:
                 if attempt == max_attempts or not is_transient_agent_error(exc):
@@ -857,7 +864,7 @@ def main() -> int:
 
         raise RuntimeError("banking agent retry loop ended without a response")
 
-    print("Running 6 banking scenarios...")
+    print(f"Running {dataset_row_count} banking scenarios from the UI Dataset...")
     print()
     print("Experiment:")
     print(f"  {experiment_name}")
@@ -880,7 +887,7 @@ def main() -> int:
     experiment_obj = response["experiment"]
     link = response.get("link") or "unavailable"
 
-    if flush_errors or len(completed_rows) != len(DATASET_CONTENT):
+    if flush_errors or len(completed_rows) != dataset_row_count:
         print(
             "ERROR: Experiment exists, but upload or root Metrics verification failed. "
             f"URL: {link}",
@@ -894,7 +901,11 @@ def main() -> int:
         wait_for_native_spans(completed_rows)
         finish_dataset_roots(completed_rows)
     print(f"Verifying root Metrics and Dataset fields: {link}")
-    verify_experiment_telemetry(str(experiment_obj.project_id), str(experiment_obj.id))
+    verify_experiment_telemetry(
+        str(experiment_obj.project_id),
+        str(experiment_obj.id),
+        dataset_rows,
+    )
     if evaluator_ids:
         create_metric_configs(
             str(experiment_obj.project_id),
@@ -910,7 +921,7 @@ def main() -> int:
     print(f"Dataset: {DATASET_NAME}")
     print("Evaluators: " + (", ".join(evaluator_names) if evaluator_names else "none"))
     print(
-        "Evaluation status: manual/asynchronous. Select the six rows in the GUI and run "
+        f"Evaluation status: manual/asynchronous. Select the {dataset_row_count} rows in the GUI and run "
         "Compute Metrics (or Recompute for failed rows); this does not rerun the Agent."
     )
     return 0

@@ -363,7 +363,7 @@ kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo \
 
 ## Splunk AO Model Economics Experiment
 
-`./scripts/galileo-experiment` 在当前唯一 Ready 的 Banking Pod 内执行镜像已有的真实 Multi-Agent workflow。它固定复用 `Banking CN Model Economics` Dataset；首次运行时创建并验证 6 行 Ground Truth，后续运行只复用，绝不覆盖或删除。Evaluator 对象继续由 Splunk AO GUI 管理，脚本不创建、修改或删除它们。
+`./scripts/galileo-experiment` 在当前唯一 Ready 的 Banking Pod 内执行镜像已有的真实 Multi-Agent workflow。`Banking CN Model Economics` 同名 Dataset 一旦存在，Splunk AO UI 中当前保存的全部行、input 和 Ground Truth 就是本次 Experiment 的权威来源；可以先在 UI 修改 Ground Truth，再运行脚本展示新的对照结果。脚本不会把它与本地默认值比较，也不会覆盖、删除或重建它。只有同名 Dataset 不存在时，脚本才用内置的 6 行默认内容创建并重新读取确认。Evaluator 对象继续由 Splunk AO GUI 管理，脚本不创建、修改或删除它们。
 
 推荐先使用 improved prompt 运行第一个 application model：
 
@@ -404,9 +404,9 @@ Same Evaluators
 Only the application model changes
 ```
 
-Experiment 的 Trace 上传完成后，脚本会先确认 6 条根 Trace 的原生子 Span 已稳定落库，且每条至少有一个带真实 provider token usage 的成功 LLM Span；明确记录为 `Error: Request timed out.` 的失败尝试会保留，但不会被误判为成功调用缺少 Token。随后脚本才完成根记录并从后端读回验证：Dataset input、Ground Truth、generated output、子 Span、LLM model 和成功 LLM Span 的 input/output/total token usage 都必须完整。每条根 Trace 的 Cost、Input/Output/Total Tokens、Latency 也必须已有数值，不能只凭子 Span 有 token 就报告成功。各阶段最多等待 180 秒，缺少任一项明确返回非零。此验收不等待 Judge 分数；Ground Truth Eval 的 pending/failed 项可稍后在 GUI 中 Compute/Recompute。Ctrl-C 不会删除 Dataset 或 Experiment。
+Experiment 的 Trace 上传完成后，脚本会按照启动时读取的 UI Dataset 行数，确认每条根 Trace 的原生子 Span 已稳定落库，且每条至少有一个带真实 provider token usage 的成功 LLM Span；明确记录为 `Error: Request timed out.` 的失败尝试会保留，但不会被误判为成功调用缺少 Token。随后脚本才完成根记录并从后端读回验证：Dataset input、UI 当前 Ground Truth、generated output、子 Span、LLM model 和成功 LLM Span 的 input/output/total token usage 都必须完整。每条根 Trace 的 Cost、Input/Output/Total Tokens、Latency 也必须已有数值，不能只凭子 Span 有 token 就报告成功。各阶段最多等待 180 秒，缺少任一项明确返回非零。此验收不等待 Judge 分数；Ground Truth Eval 的 pending/failed 项可稍后在 GUI 中 Compute/Recompute。Ctrl-C 不会删除 Dataset 或 Experiment。
 
-Instrumentation 使用 `SplunkAOCallback`，全部子 Span 通过 SDK 原生 OTLP 上传，Cost/Tokens 由平台计算。当前 legacy hosted Galileo（`app.galileo.ai`）的 OTLP 接收路径未保留 Dataset 字段，因此入口在每行 Agent 执行前，先通过官方 SDK 创建只含 Dataset input/Ground Truth 的根记录，使用与该行 OTLP 相同的 Trace ID，子 Span 列表为空。随后 Callback 原样上传子 Span；脚本确认原生 Span 和 token usage 稳定后，再通过官方 SDK 完成同一个根记录的 output、status 和实测 duration。不会创建第二条业务 Trace、重复上传子 Span或手工填写 Cost/Tokens。此适配只作用于 Experiment 进程，不修改镜像、Agent 或 Demo 1 Stream。为了避免 Judge 在 generated output 尚未写入时提前计算，现有 Ground Truth scorer 会在 6 条根记录的数据与标准指标验收完成后才绑定到 Experiment；平台可以异步计算，脚本不额外提交 Recompute，也不等待 Judge 结果。应用模型 timeout 最多尝试三次，最终失败则明确返回非零。
+Instrumentation 使用 `SplunkAOCallback`，全部子 Span 通过 SDK 原生 OTLP 上传，Cost/Tokens 由平台计算。当前 legacy hosted Galileo（`app.galileo.ai`）的 OTLP 接收路径未保留 Dataset 字段，因此入口在每行 Agent 执行前，先通过官方 SDK 创建只含该次 UI Dataset input/Ground Truth 的根记录，使用与该行 OTLP 相同的 Trace ID，子 Span 列表为空。随后 Callback 原样上传子 Span；脚本确认原生 Span 和 token usage 稳定后，再通过官方 SDK 完成同一个根记录的 output、status 和实测 duration。不会创建第二条业务 Trace、重复上传子 Span或手工填写 Cost/Tokens。此适配只作用于 Experiment 进程，不修改镜像、Agent 或 Demo 1 Stream。为了避免 Judge 在 generated output 尚未写入时提前计算，现有 Ground Truth scorer 会在全部根记录的数据与标准指标验收完成后才绑定到 Experiment；平台可以异步计算，脚本不额外提交 Recompute，也不等待 Judge 结果。应用模型 timeout 最多尝试三次，最终失败则明确返回非零。
 
 ## Destroy
 
