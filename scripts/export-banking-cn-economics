@@ -1,0 +1,785 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_FILE="${KUP_CONFIG:-${ROOT_DIR}/kup.conf}"
+DEPLOYMENT_NAME="splunk-ao-banking-qwen"
+CONTAINER_NAME="banking-chatbot"
+APP_LABEL="app.kubernetes.io/name=splunk-ao-banking-qwen"
+DEFAULT_PREFIX="Banking CN Economics"
+DEFAULT_OUTPUT="${ROOT_DIR}/data/banking_cn_economics.csv"
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+usage() {
+  cat <<EOF
+usage: $0 [--output PATH] [--prefix TEXT]
+
+Export every Splunk AO Experiment whose name starts with TEXT to one UTF-8 CSV.
+
+  --output PATH  destination CSV (default: ${DEFAULT_OUTPUT})
+  --prefix TEXT  Experiment name prefix (default: ${DEFAULT_PREFIX})
+EOF
+}
+
+OUTPUT_PATH="${DEFAULT_OUTPUT}"
+EXPERIMENT_PREFIX="${DEFAULT_PREFIX}"
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --output)
+      [[ "$#" -ge 2 ]] || die "--output requires a path"
+      OUTPUT_PATH="$2"
+      shift 2
+      ;;
+    --prefix)
+      [[ "$#" -ge 2 ]] || die "--prefix requires text"
+      EXPERIMENT_PREFIX="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "${OUTPUT_PATH}" ]] || die "output path must not be empty"
+[[ -n "${EXPERIMENT_PREFIX}" ]] || die "Experiment prefix must not be empty"
+
+need kubectl
+need python3
+
+[[ -f "${CONFIG_FILE}" ]] \
+  || die "private config not found: ${CONFIG_FILE}; copy kup.conf.example to kup.conf first"
+chmod 600 "${CONFIG_FILE}"
+
+set -a
+# shellcheck disable=SC1090
+source "${CONFIG_FILE}"
+set +a
+
+WORKDIR="${KUP_WORKDIR:-${ROOT_DIR}}"
+KUBECONFIG_FILE="${KUBECONFIG_FILE:-${WORKDIR}/kubeconfig}"
+ACK_CONTEXT="${ACK_CONTEXT:-ack-byocni-demo}"
+GALILEO_NAMESPACE="${GALILEO_NAMESPACE:-galileo-demo}"
+
+for value_name in KUBECONFIG_FILE ACK_CONTEXT GALILEO_NAMESPACE; do
+  value="${!value_name:-}"
+  [[ -n "${value}" ]] || die "required setting is empty: ${value_name}"
+  case "${value}" in
+    ReplaceMe|REPLACE_ME|replace-me) die "replace placeholder value for ${value_name} in ${CONFIG_FILE}" ;;
+  esac
+done
+
+[[ -f "${KUBECONFIG_FILE}" ]] || die "kubeconfig not found: ${KUBECONFIG_FILE}"
+
+kctl=(kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}")
+"${kctl[@]}" --request-timeout=10s get --raw=/readyz >/dev/null \
+  || die "ACK context is not reachable: ${ACK_CONTEXT}"
+"${kctl[@]}" get namespace "${GALILEO_NAMESPACE}" -o name >/dev/null \
+  || die "namespace does not exist: ${GALILEO_NAMESPACE}"
+"${kctl[@]}" -n "${GALILEO_NAMESPACE}" get deployment "${DEPLOYMENT_NAME}" -o name >/dev/null \
+  || die "deployment does not exist: ${GALILEO_NAMESPACE}/${DEPLOYMENT_NAME}"
+
+select_ready_pod() {
+  "${kctl[@]}" -n "${GALILEO_NAMESPACE}" get pod -l "${APP_LABEL}" -o json | python3 -c '
+import json
+import sys
+
+ready = []
+for pod in json.load(sys.stdin).get("items", []):
+    metadata = pod.get("metadata", {})
+    if metadata.get("deletionTimestamp"):
+        continue
+    conditions = pod.get("status", {}).get("conditions", [])
+    if any(item.get("type") == "Ready" and item.get("status") == "True" for item in conditions):
+        ready.append(metadata.get("name", ""))
+
+if len(ready) != 1:
+    print(
+        f"expected exactly one Ready, non-deleting application Pod; found {len(ready)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(ready[0])
+'
+}
+
+if ! APP_POD="$(select_ready_pod)"; then
+  die "unable to select a unique Ready Pod for ${GALILEO_NAMESPACE}/${DEPLOYMENT_NAME}"
+fi
+
+emit_export_program() {
+  cat <<'PY'
+from __future__ import annotations
+
+import csv
+import hashlib
+import math
+import os
+import sys
+import time
+import warnings
+from collections import defaultdict
+from datetime import UTC, datetime
+from typing import Any, Callable
+
+warnings.filterwarnings("ignore")
+warnings.showwarning = lambda *args, **kwargs: None
+
+from splunk_ao.config import SplunkAOConfig
+from splunk_ao.deployment import DeploymentMode, StandaloneConfig, resolve_deployment
+from splunk_ao.projects import get_project
+from splunk_ao.resources.api.experiment import (
+    list_experiments_projects_project_id_experiments_get as list_experiments_api,
+)
+from splunk_ao.resources.api.trace import (
+    query_spans_projects_project_id_spans_search_post as query_spans_api,
+    query_traces_projects_project_id_traces_search_post as query_traces_api,
+)
+from splunk_ao.resources.models.log_records_query_request import LogRecordsQueryRequest
+
+
+SCHEMA_VERSION = 1
+GROUND_TRUTH_METRIC_PREFIX = "ground truth adherence"
+SUPERVISOR_AGGREGATE_SPAN = "invoke_agent brahe-bank-supervisor-agent"
+SUPERVISOR_DIRECT_SPAN = "invoke_agent brahe-bank-supervisor-agent:Agent"
+PAGE_SIZE = 1000
+
+FIELDS = [
+    "schema_version",
+    "exported_at_utc",
+    "project_name",
+    "project_id",
+    "experiment_prefix",
+    "experiment_sequence",
+    "experiment_id",
+    "experiment_name",
+    "experiment_group_name",
+    "experiment_created_at_utc",
+    "experiment_updated_at_utc",
+    "experiment_rank",
+    "experiment_ranking_score",
+    "experiment_winner",
+    "experiment_trace_count_reported",
+    "experiment_span_count_reported",
+    "experiment_session_count_reported",
+    "dataset_id",
+    "dataset_name",
+    "dataset_version",
+    "application_model",
+    "trace_sequence",
+    "trace_id",
+    "session_id",
+    "trace_created_at_utc",
+    "trace_updated_at_utc",
+    "trace_status_code",
+    "trace_complete",
+    "scenario_key",
+    "scenario_input",
+    "ground_truth",
+    "generated_output",
+    "ground_truth_adherence_evaluator",
+    "ground_truth_adherence_metric_id",
+    "ground_truth_adherence_status",
+    "ground_truth_adherence_score",
+    "ground_truth_adherence_pass",
+    "ground_truth_adherence_scored",
+    "ground_truth_adherence_rationale",
+    "judge_model",
+    "judge_count",
+    "judge_input_tokens",
+    "judge_output_tokens",
+    "judge_total_tokens",
+    "judge_cost_usd",
+    "trace_duration_seconds",
+    "trace_cost_usd",
+    "trace_input_tokens",
+    "trace_output_tokens",
+    "trace_total_tokens",
+    "supervisor_span_count",
+    "supervisor_duration_seconds",
+    "supervisor_cost_usd",
+    "supervisor_input_tokens",
+    "supervisor_output_tokens",
+    "supervisor_total_tokens",
+    "supervisor_direct_turn_count",
+    "supervisor_direct_duration_seconds",
+    "supervisor_direct_cost_usd",
+    "supervisor_direct_input_tokens",
+    "supervisor_direct_output_tokens",
+    "supervisor_direct_total_tokens",
+    "supervisor_direct_output_share",
+    "non_supervisor_output_tokens",
+    "span_count",
+    "agent_span_count",
+    "workflow_span_count",
+    "llm_call_count",
+    "tool_call_count",
+    "retriever_call_count",
+    "error_span_count",
+    "timeout_llm_call_count",
+    "unique_tool_count",
+    "unique_tools",
+    "generated_output_chars",
+    "ground_truth_chars",
+    "output_tokens_per_second",
+    "cost_per_1k_total_tokens_usd",
+    "comparison_ready",
+]
+
+
+def require_env(name: str, *, secret: bool = False) -> str:
+    value = os.getenv(name, "").strip()
+    if not value or value == "ReplaceMe":
+        raise RuntimeError(f"required Pod setting is empty: {name}")
+    if not secret and (not value.isprintable() or "\t" in value):
+        raise RuntimeError(f"Pod setting contains unsupported control characters: {name}")
+    return value
+
+
+def is_unset(value: Any) -> bool:
+    return value.__class__.__name__ == "Unset"
+
+
+def is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def number(value: Any) -> int | float | None:
+    return value if is_number(value) else None
+
+
+def integer(value: Any) -> int | None:
+    return int(value) if is_number(value) else None
+
+
+def one_line(value: Any) -> str:
+    if value is None or is_unset(value):
+        return ""
+    text = str(value).replace("\\", "\\\\")
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n").replace("\t", "\\t")
+
+
+def iso_utc(value: Any) -> str:
+    if value is None or is_unset(value) or value == "":
+        return ""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def dict_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def metric(record: dict[str, Any], name: str) -> int | float | None:
+    return number(dict_value(record.get("metrics")).get(name))
+
+
+def sum_metric(records: list[dict[str, Any]], name: str) -> int | float | None:
+    values = [metric(record, name) for record in records]
+    numeric_values = [value for value in values if value is not None]
+    return sum(numeric_values) if numeric_values else None
+
+
+def ns_to_seconds(value: int | float | None) -> float | None:
+    return value / 1_000_000_000 if value is not None else None
+
+
+def ratio(numerator: int | float | None, denominator: int | float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def api_call(description: str, function: Callable[[], Any]) -> Any:
+    for attempt in range(1, 4):
+        try:
+            return function()
+        except Exception as exc:
+            text = f"{type(exc).__name__}: {exc}".casefold()
+            transient = any(
+                marker in text
+                for marker in (
+                    "timeout",
+                    "timed out",
+                    "connection reset",
+                    "connection refused",
+                    "http status code 502",
+                    "http status code 503",
+                    "http status code 504",
+                    "local connection failure",
+                    "remote protocol",
+                    "server disconnected",
+                    "upstream connect error",
+                    "rate limit",
+                    "temporarily unavailable",
+                )
+            )
+            if attempt == 3 or not transient:
+                raise
+            print(
+                f"WARNING: transient error during {description}; retrying ({attempt + 1}/3).",
+                file=sys.stderr,
+            )
+            time.sleep(3 * attempt)
+    raise RuntimeError(f"retry loop ended unexpectedly during {description}")
+
+
+def api_records(
+    api_module: Any,
+    project_id: str,
+    experiment_id: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen_record_ids: set[str] = set()
+    starting_token = 0
+
+    for _page in range(10_000):
+        response = api_call(
+            f"record query for Experiment {experiment_id}",
+            lambda: api_module.sync(
+                project_id=project_id,
+                client=SplunkAOConfig.get().api_client,
+                body=LogRecordsQueryRequest(
+                    experiment_id=experiment_id,
+                    starting_token=starting_token,
+                    limit=PAGE_SIZE,
+                    truncate_fields=False,
+                ),
+            ),
+        )
+        if response is None or not hasattr(response, "records"):
+            raise RuntimeError(f"record query failed for Experiment {experiment_id}")
+        raw_batch = getattr(response, "records")
+        batch = [] if raw_batch is None or is_unset(raw_batch) else list(raw_batch)
+        new_count = 0
+        for item in batch:
+            values = item.to_dict()
+            record_id = str(values.get("id") or "")
+            if record_id and record_id in seen_record_ids:
+                continue
+            if record_id:
+                seen_record_ids.add(record_id)
+            records.append(values)
+            new_count += 1
+
+        next_token = getattr(response, "next_starting_token", None)
+        if next_token is not None and not is_unset(next_token):
+            next_value = int(next_token)
+            if next_value <= starting_token:
+                break
+            starting_token = next_value
+            continue
+        if len(batch) < PAGE_SIZE:
+            break
+        if new_count == 0:
+            raise RuntimeError(f"pagination made no progress for Experiment {experiment_id}")
+        starting_token += len(batch)
+    else:
+        raise RuntimeError(f"pagination exceeded 10000 pages for Experiment {experiment_id}")
+
+    return records
+
+
+def flatten_numbers(value: Any) -> list[float]:
+    if is_number(value):
+        return [float(value)]
+    if isinstance(value, (list, tuple)):
+        result: list[float] = []
+        for item in value:
+            result.extend(flatten_numbers(item))
+        return result
+    return []
+
+
+def ground_truth_metric(root: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    metric_info = dict_value(root.get("metric_info"))
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for metric_id, raw_info in metric_info.items():
+        info = dict_value(raw_info)
+        alias = str(info.get("metric_key_alias") or "")
+        if alias.casefold().startswith(GROUND_TRUTH_METRIC_PREFIX):
+            candidates.append((str(metric_id), info))
+    if not candidates:
+        return "", {}
+    candidates.sort(
+        key=lambda item: (
+            str(item[1].get("metric_key_alias") or "").casefold() != "ground truth adherence - qwen",
+            str(item[1].get("metric_key_alias") or "").casefold(),
+            item[0],
+        )
+    )
+    if len(candidates) > 1:
+        aliases = ", ".join(str(item[1].get("metric_key_alias") or item[0]) for item in candidates)
+        print(
+            f"WARNING: Trace {root.get('id')} has multiple Ground Truth Adherence metrics; "
+            f"exporting {candidates[0][1].get('metric_key_alias')!r} from: {aliases}",
+            file=sys.stderr,
+        )
+    return candidates[0]
+
+
+def metric_score(info: dict[str, Any]) -> float | None:
+    average = number(info.get("multijudge_average"))
+    if average is not None:
+        return float(average)
+    values = flatten_numbers(info.get("value"))
+    return sum(values) / len(values) if values else None
+
+
+def is_error_span(span: dict[str, Any]) -> bool:
+    status = number(span.get("status_code"))
+    error_message = str(span.get("error_message") or "").strip()
+    return bool(error_message) or (status is not None and status >= 400)
+
+
+def is_timeout_llm_span(span: dict[str, Any]) -> bool:
+    if span.get("type") != "llm":
+        return False
+    text = " ".join(str(span.get(key) or "") for key in ("output", "error_message")).casefold()
+    return "timeout" in text or "timed out" in text
+
+
+def experiment_sort_key(experiment: Any) -> tuple[str, str]:
+    return (iso_utc(getattr(experiment, "created_at", None)), str(getattr(experiment, "id", "")))
+
+
+def trace_sort_key(trace: dict[str, Any]) -> tuple[str, str]:
+    return (iso_utc(trace.get("created_at")), str(trace.get("id") or ""))
+
+
+def main() -> int:
+    if resolve_deployment() != DeploymentMode.STANDALONE:
+        raise RuntimeError("expected standalone Splunk AO deployment")
+    require_env("SPLUNK_AO_API_KEY", secret=True)
+    project_name = require_env("SPLUNK_AO_PROJECT")
+    prefix = require_env("BANKING_EXPORT_PREFIX")
+
+    standalone = StandaloneConfig.from_env()
+    os.environ["SPLUNK_AO_API_URL"] = standalone.otlp_endpoint.removesuffix("/otel/v1/traces").rstrip("/")
+
+    project = api_call("Project lookup", lambda: get_project(name=project_name))
+    if project is None:
+        raise RuntimeError(f"Splunk AO Project not found: {project_name}")
+    project_id = str(project.id)
+
+    raw_experiments = api_call(
+        "Experiment listing",
+        lambda: list_experiments_api.sync(
+            project_id,
+            client=SplunkAOConfig.get().api_client,
+            include_counts=True,
+        ),
+    )
+    if raw_experiments is None or not isinstance(raw_experiments, list):
+        raise RuntimeError("Splunk AO did not return an Experiment list")
+    experiments = sorted(
+        [item for item in raw_experiments if str(getattr(item, "name", "")).startswith(prefix)],
+        key=experiment_sort_key,
+    )
+    if not experiments:
+        raise RuntimeError(f"no Experiments start with {prefix!r} in Project {project_name!r}")
+
+    exported_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    output_rows: list[dict[str, Any]] = []
+    ready_count = 0
+
+    for experiment_sequence, experiment in enumerate(experiments, start=1):
+        experiment_data = experiment.to_dict()
+        experiment_id = str(experiment_data.get("id") or "")
+        experiment_name = str(experiment_data.get("name") or "")
+        traces = api_records(query_traces_api, project_id, experiment_id)
+        spans = api_records(query_spans_api, project_id, experiment_id)
+        traces.sort(key=trace_sort_key)
+
+        spans_by_trace: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for span in spans:
+            spans_by_trace[str(span.get("trace_id") or "")].append(span)
+
+        dataset = dict_value(experiment_data.get("dataset"))
+        for trace_sequence, root in enumerate(traces, start=1):
+            trace_id = str(root.get("trace_id") or root.get("id") or "")
+            trace_spans = spans_by_trace.get(trace_id, [])
+            supervisor = [
+                span
+                for span in trace_spans
+                if span.get("type") == "agent" and span.get("name") == SUPERVISOR_AGGREGATE_SPAN
+            ]
+            supervisor_direct = [
+                span
+                for span in trace_spans
+                if span.get("type") == "agent" and span.get("name") == SUPERVISOR_DIRECT_SPAN
+            ]
+            llm_spans = [span for span in trace_spans if span.get("type") == "llm"]
+            tool_spans = [span for span in trace_spans if span.get("type") == "tool"]
+            retriever_spans = [span for span in trace_spans if span.get("type") == "retriever"]
+            agent_spans = [span for span in trace_spans if span.get("type") == "agent"]
+            workflow_spans = [span for span in trace_spans if span.get("type") == "workflow"]
+
+            gt_metric_id, gt_info = ground_truth_metric(root)
+            gt_score = metric_score(gt_info)
+            gt_status = str(gt_info.get("status_type") or "")
+            gt_scored = int(gt_score is not None)
+            gt_pass: int | str = int(gt_score >= 1.0) if gt_score is not None else ""
+
+            trace_duration_ns = metric(root, "duration_ns")
+            trace_duration_seconds = ns_to_seconds(trace_duration_ns)
+            trace_cost = metric(root, "cost")
+            trace_input_tokens = metric(root, "num_input_tokens")
+            trace_output_tokens = metric(root, "num_output_tokens")
+            trace_total_tokens = metric(root, "num_total_tokens")
+            supervisor_output_tokens = sum_metric(supervisor, "num_output_tokens")
+            supervisor_direct_output_tokens = sum_metric(supervisor_direct, "num_output_tokens")
+            trace_complete = bool(root.get("is_complete"))
+            trace_status = integer(root.get("status_code"))
+            core_values = (
+                trace_duration_seconds,
+                trace_cost,
+                trace_input_tokens,
+                trace_output_tokens,
+                trace_total_tokens,
+                supervisor_output_tokens,
+                gt_score,
+            )
+            comparison_ready = int(
+                trace_complete
+                and trace_status == 200
+                and all(value is not None for value in core_values)
+                and gt_status == "success"
+            )
+            ready_count += comparison_ready
+
+            application_models = sorted(
+                {str(span.get("model")) for span in llm_spans if span.get("model")}
+            )
+            tools = sorted(
+                {
+                    str(span.get("name") or "").removeprefix("execute_tool ")
+                    for span in tool_spans
+                    if span.get("name")
+                }
+            )
+            scenario_input = str(root.get("dataset_input") or root.get("input") or "")
+            generated_output = str(root.get("output") or root.get("dataset_generated_output") or "")
+            ground_truth = str(root.get("dataset_output") or "")
+
+            row = {
+                "schema_version": SCHEMA_VERSION,
+                "exported_at_utc": exported_at,
+                "project_name": one_line(project_name),
+                "project_id": project_id,
+                "experiment_prefix": one_line(prefix),
+                "experiment_sequence": experiment_sequence,
+                "experiment_id": experiment_id,
+                "experiment_name": one_line(experiment_name),
+                "experiment_group_name": one_line(experiment_data.get("experiment_group_name")),
+                "experiment_created_at_utc": iso_utc(experiment_data.get("created_at")),
+                "experiment_updated_at_utc": iso_utc(experiment_data.get("updated_at")),
+                "experiment_rank": integer(experiment_data.get("rank")),
+                "experiment_ranking_score": number(experiment_data.get("ranking_score")),
+                "experiment_winner": int(bool(experiment_data.get("winner"))) if experiment_data.get("winner") is not None else "",
+                "experiment_trace_count_reported": integer(experiment_data.get("num_traces")),
+                "experiment_span_count_reported": integer(experiment_data.get("num_spans")),
+                "experiment_session_count_reported": integer(experiment_data.get("num_sessions")),
+                "dataset_id": one_line(dataset.get("dataset_id")),
+                "dataset_name": one_line(dataset.get("name")),
+                "dataset_version": integer(dataset.get("version_index")),
+                "application_model": one_line(";".join(application_models)),
+                "trace_sequence": trace_sequence,
+                "trace_id": trace_id,
+                "session_id": one_line(root.get("session_id")),
+                "trace_created_at_utc": iso_utc(root.get("created_at")),
+                "trace_updated_at_utc": iso_utc(root.get("updated_at")),
+                "trace_status_code": trace_status,
+                "trace_complete": int(trace_complete),
+                "scenario_key": hashlib.sha256(scenario_input.encode("utf-8")).hexdigest()[:16],
+                "scenario_input": one_line(scenario_input),
+                "ground_truth": one_line(ground_truth),
+                "generated_output": one_line(generated_output),
+                "ground_truth_adherence_evaluator": one_line(gt_info.get("metric_key_alias")),
+                "ground_truth_adherence_metric_id": gt_metric_id,
+                "ground_truth_adherence_status": one_line(gt_status),
+                "ground_truth_adherence_score": gt_score,
+                "ground_truth_adherence_pass": gt_pass,
+                "ground_truth_adherence_scored": gt_scored,
+                "ground_truth_adherence_rationale": one_line(gt_info.get("rationale")),
+                "judge_model": one_line(gt_info.get("model_alias")),
+                "judge_count": integer(gt_info.get("num_judges")),
+                "judge_input_tokens": integer(gt_info.get("input_tokens")),
+                "judge_output_tokens": integer(gt_info.get("output_tokens")),
+                "judge_total_tokens": integer(gt_info.get("total_tokens")),
+                "judge_cost_usd": number(gt_info.get("cost")),
+                "trace_duration_seconds": trace_duration_seconds,
+                "trace_cost_usd": trace_cost,
+                "trace_input_tokens": integer(trace_input_tokens),
+                "trace_output_tokens": integer(trace_output_tokens),
+                "trace_total_tokens": integer(trace_total_tokens),
+                "supervisor_span_count": len(supervisor),
+                "supervisor_duration_seconds": ns_to_seconds(sum_metric(supervisor, "duration_ns")),
+                "supervisor_cost_usd": sum_metric(supervisor, "cost"),
+                "supervisor_input_tokens": integer(sum_metric(supervisor, "num_input_tokens")),
+                "supervisor_output_tokens": integer(supervisor_output_tokens),
+                "supervisor_total_tokens": integer(sum_metric(supervisor, "num_total_tokens")),
+                "supervisor_direct_turn_count": len(supervisor_direct),
+                "supervisor_direct_duration_seconds": ns_to_seconds(sum_metric(supervisor_direct, "duration_ns")),
+                "supervisor_direct_cost_usd": sum_metric(supervisor_direct, "cost"),
+                "supervisor_direct_input_tokens": integer(sum_metric(supervisor_direct, "num_input_tokens")),
+                "supervisor_direct_output_tokens": integer(supervisor_direct_output_tokens),
+                "supervisor_direct_total_tokens": integer(sum_metric(supervisor_direct, "num_total_tokens")),
+                "supervisor_direct_output_share": ratio(supervisor_direct_output_tokens, trace_output_tokens),
+                "non_supervisor_output_tokens": (
+                    integer(trace_output_tokens - supervisor_direct_output_tokens)
+                    if trace_output_tokens is not None and supervisor_direct_output_tokens is not None
+                    else None
+                ),
+                "span_count": len(trace_spans),
+                "agent_span_count": len(agent_spans),
+                "workflow_span_count": len(workflow_spans),
+                "llm_call_count": len(llm_spans),
+                "tool_call_count": len(tool_spans),
+                "retriever_call_count": len(retriever_spans),
+                "error_span_count": sum(1 for span in trace_spans if is_error_span(span)),
+                "timeout_llm_call_count": sum(1 for span in llm_spans if is_timeout_llm_span(span)),
+                "unique_tool_count": len(tools),
+                "unique_tools": one_line(";".join(tools)),
+                "generated_output_chars": len(generated_output),
+                "ground_truth_chars": len(ground_truth),
+                "output_tokens_per_second": ratio(trace_output_tokens, trace_duration_seconds),
+                "cost_per_1k_total_tokens_usd": (
+                    trace_cost * 1000 / trace_total_tokens
+                    if trace_cost is not None and trace_total_tokens is not None and trace_total_tokens > 0
+                    else None
+                ),
+                "comparison_ready": comparison_ready,
+            }
+            output_rows.append(row)
+
+        orphan_spans = [span for span in spans if str(span.get("trace_id") or "") not in {str(t.get("trace_id") or t.get("id") or "") for t in traces}]
+        if orphan_spans:
+            print(
+                f"WARNING: Experiment {experiment_name!r} has {len(orphan_spans)} Spans without an exported root Trace",
+                file=sys.stderr,
+            )
+
+    writer = csv.DictWriter(sys.stdout, fieldnames=FIELDS, extrasaction="raise", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(output_rows)
+    print(
+        f"Exported {len(experiments)} Experiments, {len(output_rows)} Traces, "
+        f"{ready_count} comparison-ready rows.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("Export interrupted; the destination CSV was not replaced.", file=sys.stderr)
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+PY
+}
+
+OUTPUT_DIR="$(dirname "${OUTPUT_PATH}")"
+mkdir -p "${OUTPUT_DIR}"
+TEMP_FILE="$(mktemp "${OUTPUT_DIR}/.$(basename "${OUTPUT_PATH}").tmp.XXXXXX")"
+cleanup() {
+  [[ -z "${TEMP_FILE:-}" || ! -f "${TEMP_FILE}" ]] || rm -f -- "${TEMP_FILE}"
+}
+trap cleanup EXIT INT TERM
+
+emit_export_program | \
+  "${kctl[@]}" -n "${GALILEO_NAMESPACE}" exec -i "${APP_POD}" -c "${CONTAINER_NAME}" -- \
+    env PYTHONWARNINGS=ignore SPLUNK_AO_LOG_LEVEL=ERROR \
+      "BANKING_EXPORT_PREFIX=${EXPERIMENT_PREFIX}" python -W ignore -u - >"${TEMP_FILE}"
+
+python3 - "${TEMP_FILE}" "${EXPERIMENT_PREFIX}" <<'PY'
+import csv
+import sys
+from collections import defaultdict
+
+path, expected_prefix = sys.argv[1:]
+with open(path, newline="", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    rows = list(reader)
+    headers = reader.fieldnames or []
+
+required = {
+    "experiment_id",
+    "experiment_name",
+    "application_model",
+    "dataset_version",
+    "trace_sequence",
+    "trace_id",
+    "scenario_input",
+    "ground_truth_adherence_pass",
+    "trace_duration_seconds",
+    "trace_cost_usd",
+    "supervisor_output_tokens",
+    "comparison_ready",
+}
+missing = sorted(required - set(headers))
+if missing:
+    raise SystemExit(f"CSV validation failed; missing columns: {', '.join(missing)}")
+if not rows:
+    raise SystemExit("CSV validation failed; no Trace rows were exported")
+
+keys = [(row["experiment_id"], row["trace_id"]) for row in rows]
+if len(keys) != len(set(keys)):
+    raise SystemExit("CSV validation failed; duplicate Experiment/Trace keys")
+
+sequences = defaultdict(list)
+models = set()
+ready = 0
+for row in rows:
+    if not row["experiment_name"].startswith(expected_prefix):
+        raise SystemExit("CSV validation failed; an Experiment does not match the requested prefix")
+    sequences[row["experiment_id"]].append(int(row["trace_sequence"]))
+    if row["application_model"]:
+        models.add(row["application_model"])
+    ready += int(row["comparison_ready"])
+    for field in ("trace_duration_seconds", "trace_cost_usd", "supervisor_output_tokens"):
+        if row[field] == "":
+            continue
+        float(row[field])
+
+for experiment_id, values in sequences.items():
+    if sorted(values) != list(range(1, len(values) + 1)):
+        raise SystemExit(f"CSV validation failed; non-contiguous Trace sequence in {experiment_id}")
+
+print(
+    f"Validated CSV: {len(sequences)} Experiments, {len(rows)} Traces, "
+    f"{ready} comparison-ready, models={','.join(sorted(models)) or 'unknown'}.",
+    file=sys.stderr,
+)
+PY
+
+chmod 644 "${TEMP_FILE}"
+mv -f -- "${TEMP_FILE}" "${OUTPUT_PATH}"
+TEMP_FILE=""
+printf 'CSV written: %s\n' "${OUTPUT_PATH}"

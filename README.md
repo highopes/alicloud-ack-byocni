@@ -408,6 +408,43 @@ Experiment 的 Trace 上传完成后，脚本会按照启动时读取的 UI Data
 
 Instrumentation 使用 `SplunkAOCallback`，全部子 Span 通过 SDK 原生 OTLP 上传，Cost/Tokens 由平台计算。当前 legacy hosted Galileo（`app.galileo.ai`）的 OTLP 接收路径未保留 Dataset 字段，因此入口在每行 Agent 执行前，先通过官方 SDK 创建只含该次 UI Dataset input/Ground Truth 的根记录，使用与该行 OTLP 相同的 Trace ID，子 Span 列表为空。随后 Callback 原样上传子 Span；脚本确认原生 Span 和 token usage 稳定后，再通过官方 SDK 完成同一个根记录的 output、status 和实测 duration。不会创建第二条业务 Trace、重复上传子 Span或手工填写 Cost/Tokens。此适配只作用于 Experiment 进程，不修改镜像、Agent 或 Demo 1 Stream。为了避免 Judge 在 generated output 尚未写入时提前计算，现有 Ground Truth scorer 会在全部根记录完成后绑定到 Experiment，并与后续根级 Cost/Token 验收解耦；即使平台不能为某个新模型生成标准指标，也不会跳过 Ground Truth Eval。平台可以异步计算 Judge，脚本不额外提交 Recompute，也不等待 Judge 结果。应用模型 timeout 最多尝试三次，最终失败则明确返回非零。
 
+## Export Model Economics data for Splunk Enterprise
+
+`./scripts/export-banking-cn-economics` 通过当前唯一 Ready 的 Banking Pod 和其中已经固定的 `splunk-ao==0.4.0`，只读导出当前 Project 内名称以 `Banking CN Economics` 开头的全部 Experiment。它查询 Experiment、根 Trace 与完整 Span 树，不调用 Agent、不创建或修改 Splunk AO 对象，也不从公开价格表推算费用。默认结果写入 `data/banking_cn_economics.csv`：
+
+```bash
+./scripts/export-banking-cn-economics
+
+# 可选：导出到其他位置，或改变 Experiment 前缀
+./scripts/export-banking-cn-economics --output /absolute/path/banking_cn_economics.csv
+./scripts/export-banking-cn-economics --prefix 'Banking CN Economics'
+```
+
+写入是原子的：远端 API、Kubernetes 连接或本地校验失败时不会替换现有 CSV。Splunk AO 的 timeout、502、503、504、上游 reset 与 rate limit 会有限重试三次，持续失败仍返回非零。CSV 使用 UTF-8 和 LF，一条 Trace 对应一个物理行；Ground Truth、Generated Output 与 Judge rationale 中的换行编码为字面量 `\n`，便于 Splunk Enterprise 作为 CSV lookup 稳定读取。CSV 不包含 API key、kubeconfig、RAM credential 或 Pod Secret。
+
+主要字段按以下口径生成：
+
+| 维度 | CSV 字段 | 口径 |
+| --- | --- | --- |
+| 质量 | `ground_truth_adherence_score`、`ground_truth_adherence_pass`、`ground_truth_adherence_scored` | 动态查找 alias 以 `Ground Truth Adherence` 开头的 Trace metric。严格以 score `1` 为合格，未完成 Judge 的行保持空值而不是误记为不合格。 |
+| 详细性 | `supervisor_output_tokens` | 顶层 `invoke_agent brahe-bank-supervisor-agent` Span 的汇总 output tokens；包含该 Supervisor 调用树中的下游 Agent，是 Dashboard 的主比较指标。 |
+| Supervisor 自身开销 | `supervisor_direct_output_tokens`、`supervisor_direct_turn_count` | 只合计 `invoke_agent brahe-bank-supervisor-agent:Agent` 的直接推理轮次，排除 credit-card/credit-score 子 Agent。 |
+| 性能 | `trace_duration_seconds` | 根 Trace 的后端 `duration_ns` 除以 `1e9`，不使用页面格式化字符串。 |
+| 价格 | `trace_cost_usd` | 根 Trace 的平台 Cost；Judge 的独立费用保存在 `judge_cost_usd`，两者不混加。 |
+| 运行复杂度 | `span_count`、`llm_call_count`、`tool_call_count`、`retriever_call_count`、`error_span_count` | 从该 Trace 的完整 Span 树直接计数。 |
+| 可比性 | `dataset_id`、`dataset_version`、`scenario_key`、`comparison_ready` | `scenario_key` 由 Dataset input 稳定生成；核心指标、Judge 与 Supervisor 数据齐全且 Trace 成功时 `comparison_ready=1`。 |
+
+Dashboard 应按 `experiment_id` 聚合，不能把同一 model 的多次运行静默合并。各 Experiment 的总耗时、总费用、Supervisor 输出数与合格率分别使用 `sum(trace_duration_seconds)`、`sum(trace_cost_usd)`、`sum(supervisor_output_tokens)` 和 `sum(ground_truth_adherence_pass) / sum(ground_truth_adherence_scored)`。如果 `dataset_version` 不一致，必须显示可比性警告，并以 `scenario_key` 对齐共同场景。
+
+当前提交的 CSV 快照已在线读回并通过本地结构校验，共 2 个 Experiment、12 条 Trace，全部 `comparison_ready=1`：
+
+| Application model | Dataset version | Ground Truth 合格 | 6 Trace 总耗时（秒） | 6 Trace 总费用（USD） | Supervisor output tokens |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `qwen3.7-flash` | 1 | 6/6（100%） | 478.763938 | 0.002528790050 | 16,878 |
+| `qwen3.8-max` | 6 | 6/6（100%） | 157.938983 | 0.105030042003 | 4,917 |
+
+两个现有运行的 Dataset version 分别为 1 和 6，因此费用、性能和运行结构可以直接展示，质量结论则必须同时展示版本不一致提示，不能写成严格的单变量模型因果对比。重新运行导出器会从平台刷新同一路径的数据快照。
+
 ## Destroy
 
 ```bash
