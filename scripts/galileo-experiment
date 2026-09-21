@@ -900,19 +900,22 @@ def main() -> int:
     if LEGACY_HOSTED_GALILEO:
         wait_for_native_spans(completed_rows)
         finish_dataset_roots(completed_rows)
-    print(f"Verifying root Metrics and Dataset fields: {link}")
-    verify_experiment_telemetry(
-        str(experiment_obj.project_id),
-        str(experiment_obj.id),
-        dataset_rows,
-    )
+    # Ground Truth and generated output are now complete. Bind the existing
+    # Judge before validating backend-derived Cost/Token aggregates so a
+    # standard-metric failure cannot suppress the independent evaluator.
     if evaluator_ids:
         create_metric_configs(
             str(experiment_obj.project_id),
             str(experiment_obj.id),
             evaluator_ids,
         )
-        print("Ground Truth evaluator bound after telemetry completion; scoring is asynchronous.")
+        print("Ground Truth evaluator bound after root completion; scoring is asynchronous.")
+    print(f"Verifying root Metrics and Dataset fields: {link}")
+    verify_experiment_telemetry(
+        str(experiment_obj.project_id),
+        str(experiment_obj.id),
+        dataset_rows,
+    )
     print("Experiment submitted successfully.")
     print(f"ID: {experiment_obj.id}")
     print(f"Name: {experiment_obj.name}")

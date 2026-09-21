@@ -406,7 +406,7 @@ Only the application model changes
 
 Experiment 的 Trace 上传完成后，脚本会按照启动时读取的 UI Dataset 行数，确认每条根 Trace 的原生子 Span 已稳定落库，且每条至少有一个带真实 provider token usage 的成功 LLM Span；明确记录为 `Error: Request timed out.` 的失败尝试会保留，但不会被误判为成功调用缺少 Token。随后脚本才完成根记录并从后端读回验证：Dataset input、UI 当前 Ground Truth、generated output、子 Span、LLM model 和成功 LLM Span 的 input/output/total token usage 都必须完整。每条根 Trace 的 Cost、Input/Output/Total Tokens、Latency 也必须已有数值，不能只凭子 Span 有 token 就报告成功。各阶段最多等待 180 秒，缺少任一项明确返回非零。此验收不等待 Judge 分数；Ground Truth Eval 的 pending/failed 项可稍后在 GUI 中 Compute/Recompute。Ctrl-C 不会删除 Dataset 或 Experiment。
 
-Instrumentation 使用 `SplunkAOCallback`，全部子 Span 通过 SDK 原生 OTLP 上传，Cost/Tokens 由平台计算。当前 legacy hosted Galileo（`app.galileo.ai`）的 OTLP 接收路径未保留 Dataset 字段，因此入口在每行 Agent 执行前，先通过官方 SDK 创建只含该次 UI Dataset input/Ground Truth 的根记录，使用与该行 OTLP 相同的 Trace ID，子 Span 列表为空。随后 Callback 原样上传子 Span；脚本确认原生 Span 和 token usage 稳定后，再通过官方 SDK 完成同一个根记录的 output、status 和实测 duration。不会创建第二条业务 Trace、重复上传子 Span或手工填写 Cost/Tokens。此适配只作用于 Experiment 进程，不修改镜像、Agent 或 Demo 1 Stream。为了避免 Judge 在 generated output 尚未写入时提前计算，现有 Ground Truth scorer 会在全部根记录的数据与标准指标验收完成后才绑定到 Experiment；平台可以异步计算，脚本不额外提交 Recompute，也不等待 Judge 结果。应用模型 timeout 最多尝试三次，最终失败则明确返回非零。
+Instrumentation 使用 `SplunkAOCallback`，全部子 Span 通过 SDK 原生 OTLP 上传，Cost/Tokens 由平台计算。当前 legacy hosted Galileo（`app.galileo.ai`）的 OTLP 接收路径未保留 Dataset 字段，因此入口在每行 Agent 执行前，先通过官方 SDK 创建只含该次 UI Dataset input/Ground Truth 的根记录，使用与该行 OTLP 相同的 Trace ID，子 Span 列表为空。随后 Callback 原样上传子 Span；脚本确认原生 Span 和 token usage 稳定后，再通过官方 SDK 完成同一个根记录的 output、status 和实测 duration。不会创建第二条业务 Trace、重复上传子 Span或手工填写 Cost/Tokens。此适配只作用于 Experiment 进程，不修改镜像、Agent 或 Demo 1 Stream。为了避免 Judge 在 generated output 尚未写入时提前计算，现有 Ground Truth scorer 会在全部根记录完成后绑定到 Experiment，并与后续根级 Cost/Token 验收解耦；即使平台不能为某个新模型生成标准指标，也不会跳过 Ground Truth Eval。平台可以异步计算 Judge，脚本不额外提交 Recompute，也不等待 Judge 结果。应用模型 timeout 最多尝试三次，最终失败则明确返回非零。
 
 ## Destroy
 
@@ -419,6 +419,36 @@ Instrumentation 使用 `SplunkAOCallback`，全部子 Span 通过 SDK 原生 OTL
 `kiall` 不扫描账号、区域或 VPC，也不会删除 state 外“看起来像 Demo”的资源。再次执行 `./kiall` 应安全显示没有资源需要销毁。
 
 ## Troubleshooting
+
+### Galileo Experiment 出现 Ground Truth N/A 或根级 Cost/Tokens 为空
+
+当前私有配置使用的是 legacy hosted Galileo Console：`https://app.galileo.ai`，SDK 推导出的 API backend 为 `https://api.galileo.ai`。Banking 镜像则固定使用已经更名并演进到 Splunk Agent Observability 的 `splunk-ao==0.4.0` 和 `SplunkAOCallback`。这两者不是完全不兼容：旧后端能够接收 Callback 的原生 OTLP Span、LLM model、Token usage、工具调用和输出；实际兼容差异集中在 Experiment 根记录。
+
+在旧后端上确认过的根因和失败模式如下：
+
+* SDK 原生 OTLP 子 Span 可以完整到达，但 legacy 接收路径不会可靠地把 SDK Experiment 上下文中的 Dataset input/Ground Truth 保留到可供 Ground Truth Eval 使用的根 Trace。只使用 Callback 时会看到 Token/Cost，却可能得到 Ground Truth N/A。
+* 反过来，如果用记录 API 替代原生 OTLP、重新上传整个 Trace/Span 树，Dataset 字段能够保留，但会绕过或扰乱后端对原生 Span 的标准指标处理，导致根级 Cost、Input/Output/Total Tokens 为空。不能用这种方式替换 Callback。
+* 即使 Dataset 根记录和 Callback 子 Span 使用同一个 Trace ID，若在最后一批原生 Span 和 provider token usage 可搜索之前就把根记录标记 complete，旧后端可能过早结算根级指标；之后再次 PATCH complete 不保证重新汇总。
+* Ground Truth Judge 不能在 generated output 尚未写入时绑定并抢跑，否则会基于 `output=null` 得到错误结果；但也不能等到根级 Cost/Token 验收成功后才绑定，否则标准指标失败会连带跳过独立的 Ground Truth Eval。
+* 新 application model 刚上线或模型别名尚未被后端定价/指标目录识别时，LLM 子 Span 可能已经有真实 Token，但 Cost 暂时为 `null`，根级聚合也可能延迟。Cost 和根级标准指标由平台计算；脚本不根据公开价目表手工伪造，因为区域、缓存命中和计费模式可能不同。
+
+因此 `galileo-experiment` 对 `app.galileo.ai` 使用一个受限的兼容流程：先通过官方 SDK 创建只含 UI Dataset input/Ground Truth 的根记录，并使用与 Callback OTLP 完全相同的后端 Trace ID 和 session；业务 Agent 和全部子 Span 仍由 `SplunkAOCallback` 原生上传；脚本连续确认每条根 Trace 的 Span 集合和真实 Token usage 稳定后，才完成同一个根记录的 generated output、status 和实测 duration；随后立即绑定现有 Ground Truth Evaluator，使其不受 Cost/Token 验收结果影响；最后读回验证根级 Cost、Tokens 和 Latency。该流程不重复上传子 Span、不手工计算 Metrics，也不修改镜像、Agent graph 或 Demo 1 Agent Stream。
+
+这确实是为了在不 rebuild 镜像的前提下兼容当前旧 Galileo 云端后端，但切回新的 Splunk AO Console 后，脚本不会因此失效。它根据 Pod 中规范化后的 Console hostname 自动选择路径：
+
+| Console/backend | Trace 路径 |
+| --- | --- |
+| `app.galileo.ai` / `api.galileo.ai` | 启用上述 legacy Dataset-root 兼容层，同时保留 Callback 原生 OTLP 子 Span |
+| 其他由 `splunk-ao==0.4.0` Standalone 配置推导的 Console/API（包括新的 Splunk AO hosted backend） | 跳过 legacy root workaround，使用 SDK 原生 OTLP Experiment 路径 |
+
+新的 Splunk AO backend 路径已经按 SDK 合约实现，但当前仓库环境只对 `app.galileo.ai` 做过完整在线验收。因此以后切换 Console 时不应先删除 workaround 或修改镜像；先修改 `kup.conf`，运行 `./kup --galileo-only` 让 ConfigMap/Secret/Pod 收敛，再运行脚本并确认启动横幅显示预期的 Console、API backend 和 `Trace ingest: SDK OTLP`。若新后端或未来 SDK 改变 Dataset/Experiment 合约，再仅调整非 legacy 分支并重新验收；不要让 legacy workaround 无条件运行在新后端。
+
+排查时先区分数据层级：
+
+* Dataset 已存在时，UI 中当前保存的行和 Ground Truth 是唯一权威来源；本地默认 6 行只用于首次创建。
+* 根 Trace 的 Ground Truth/Generated Output 完整但 Ground Truth Eval 尚无结果，先确认 Evaluator 已绑定；Judge 是异步的，单行失败可以在 UI Recompute，不应重跑 Agent。
+* 根级 Token/Cost 为空但 LLM 子 Span 已有 Token，说明 Agent 和 Callback 数据没有丢失，问题位于后端的模型定价或根级聚合；不要重复上传 Trace，也不要手工回填 Cost。
+* 脚本只有在 Dataset 字段、generated output、子 Span、成功 LLM token usage 以及每条根 Trace 的 Cost/Tokens/Latency 都读回完整后才打印 `Experiment submitted successfully`。若它以非零状态退出，Experiment 和已采集数据仍保留，应根据打印的 URL 检查，而不是删除后盲目重跑。
 
 ### Terraform credential error
 
