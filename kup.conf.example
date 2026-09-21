@@ -1,15 +1,32 @@
-# Public defaults for the ACK BYOCNI demo.
-# Copy this file to kup.conf and replace every ReplaceMe placeholder.
+# Required manual values are marked ReplaceMe.
 
-KUP_WORKDIR="${SCRIPT_DIR}"
+# ----------------------------------------------------------------------
+# Local project
+# ----------------------------------------------------------------------
+
+KUP_WORKDIR="ReplaceMe"
+
 KUBECONFIG_FILE="${KUP_WORKDIR}/kubeconfig"
 ACK_CONTEXT="ack-byocni-demo"
 
-ALICLOUD_ACCESS_KEY="ReplaceMe"
-ALICLOUD_SECRET_KEY="ReplaceMe"
-ACK_NODE_PASSWORD="ReplaceMe"
+# ----------------------------------------------------------------------
+# Alibaba Cloud credentials
+# ----------------------------------------------------------------------
+# Obtain from:
+# RAM Console -> Identities -> Users -> <automation RAM user>
+# -> Credential/Authentication -> AccessKey -> Create AccessKey
+#
+# AccessKey Secret may only be displayed once. Save it immediately.
+
+ALICLOUD_ACCESS_KEY='ReplaceMe'
+ALICLOUD_SECRET_KEY='ReplaceMe'
+
+# ----------------------------------------------------------------------
+# Alibaba Cloud / ACK infrastructure
+# ----------------------------------------------------------------------
 
 ALIBABA_CLOUD_REGION="cn-wulanchabu"
+
 ACK_NAME_PREFIX="ack-byocni-wlcb"
 ACK_CLUSTER_SPEC="ack.pro.small"
 
@@ -18,71 +35,124 @@ ACK_VSW_CIDR="10.10.1.0/24"
 ACK_POD_CIDR="172.20.0.0/16"
 ACK_SERVICE_CIDR="172.21.0.0/20"
 ACK_NODE_CIDR_MASK="24"
+
+# Leave empty to let Terraform select a compatible zone automatically.
 ACK_ZONE_ID=""
 
 ACK_INSTANCE_TYPE="ecs.e-c1m2.xlarge"
 ACK_NODE_COUNT="3"
+
 ACK_SYSTEM_DISK_CATEGORY="cloud_essd_entry"
 ACK_SYSTEM_DISK_SIZE="40"
+
 ACK_ENABLE_NAT_GATEWAY="true"
 ACK_ENABLE_PUBLIC_APISERVER="true"
+
+# This is a password you choose for the disposable ACK worker nodes.
+ACK_NODE_PASSWORD="ReplaceMe"
+
+# ----------------------------------------------------------------------
+# Cilium cluster identity
+# ----------------------------------------------------------------------
 
 CILIUM_CLUSTER_NAME="ack-byocni-demo"
 CILIUM_CLUSTER_ID="0"
 
+# ----------------------------------------------------------------------
+# Isovalent Enterprise repository
+# ----------------------------------------------------------------------
+# Sensitive.
+
+ISO_REPO_URL="ReplaceMe"
+
+# ----------------------------------------------------------------------
+# Pinned Enterprise chart versions
+# ----------------------------------------------------------------------
+# These defaults follow the currently referenced AWS demo implementation.
+# During migration, Codex must compare them with the local AWS working
+# directory and use the local AWS versions if they differ.
+
 CILIUM_CHART_VER="1.18.11"
 TETRAGON_CHART_VER="1.18.5"
 TPR_CHART_VER="1.18.2"
+
 HUBBLE_UI_CHART_VER="1.3.12"
 HUBBLE_TIMESCAPE_CHART_VER="1.8.4"
 HUBBLE_ENTERPRISE_CHART_VER="1.13.4"
 
+# ----------------------------------------------------------------------
+# Demo namespaces / local access
+# ----------------------------------------------------------------------
+
 DEMO_NAMESPACE="demo"
 TEST_NAMESPACE="test"
+
 HUBBLE_UI_LOCAL_PORT="18080"
 
-# Multi-agent banking chatbot from https://github.com/highopes/galileo-demo.
-# The image must be an immutable linux/amd64 digest already published to the
-# configured registry. Registry, model, Splunk AO, and Pinecone credentials
-# stay only in the private kup.conf.
+# ----------------------------------------------------------------------
+# Galileo / Splunk AO multi-agent banking chatbot
+# ----------------------------------------------------------------------
+
 GALILEO_NAMESPACE="galileo-demo"
 GALILEO_SOURCE_URL="https://github.com/highopes/galileo-demo"
 GALILEO_SOURCE_COMMIT="26ea7c0c3276cde94b6f5c1bff2b0d741d655858"
-GALILEO_IMAGE_REF="ReplaceMe"
-GALILEO_REGISTRY_SERVER="ReplaceMe"
-GALILEO_REGISTRY_USERNAME="ReplaceMe"
-GALILEO_REGISTRY_PASSWORD="ReplaceMe"
+GALILEO_IMAGE_REF="crpi-2c8evg6ltz498jql.cn-wulanchabu.personal.cr.aliyuncs.com/highope/multi-agent-banking@sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53"
+GALILEO_REGISTRY_SERVER="crpi-2c8evg6ltz498jql.cn-wulanchabu.personal.cr.aliyuncs.com"
+
+# SaaS based Splunk AO
+# GALILEO_SPLUNK_AO_CONSOLE_URL="https://console.multitenant.galileocloud.io"
+# GALILEO_SPLUNK_AO_API_KEY="ReplaceMe"
+
+# SaaS based Original Galileo
+GALILEO_SPLUNK_AO_CONSOLE_URL="https://app.galileo.ai/"
 GALILEO_SPLUNK_AO_API_KEY="ReplaceMe"
-GALILEO_SPLUNK_AO_PROJECT="Multi-Agent Banking Chatbot"
-GALILEO_SPLUNK_AO_AGENT_STREAM="Default Agent Stream"
-GALILEO_SPLUNK_AO_CONSOLE_URL="https://console.multitenant.galileocloud.io"
+
+GALILEO_SPLUNK_AO_PROJECT="hangwe-Multi-Agent Banking Chatbot - Qwen Judge Demo"
+GALILEO_SPLUNK_AO_AGENT_STREAM="hangwe-Default Agent Stream - Qwen Judge"
+
 GALILEO_APP_MODEL_PROVIDER="bailian"
 GALILEO_APP_MODEL_NAME="qwen3.7-flash"
 GALILEO_APP_MODEL_BASE_URL="ReplaceMe"
 GALILEO_APP_MODEL_API_KEY="ReplaceMe"
+
 GALILEO_MODEL_REQUEST_TIMEOUT="120"
 GALILEO_MODEL_MAX_RETRIES="2"
 GALILEO_PINECONE_API_KEY="ReplaceMe"
 GALILEO_PINECONE_INDEX_NAME="credit-card-information-qwen-demo"
 GALILEO_PINECONE_NAMESPACE="bank-docs"
 GALILEO_PINECONE_TEXT_FIELD="chunk_text"
-GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS="Action Advancement - Qwen,Action Completion - Qwen,Tool Errors - Qwen,Tool Selection Quality - Qwen"
+
+GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS="Action Advancement - Qwen,Action Completion - Qwen,Tool Errors - Qwen,Tool Selection Quality - Qwen,Ground Truth Adherence - Qwen"
 GALILEO_SPLUNK_AO_EXPERIMENT_DATASET=""
+
 GALILEO_SUPERVISOR_PROMPT_PROFILE="baseline"
-# Which baseline kup leaves active through the upstream switch_prompt.sh:
-# qwen => custom app/prompts/supervisor-baseline-qwen.txt; official => baseline.
 GALILEO_BASELINE_PROMPT_VARIANT="qwen"
+
 GALILEO_PROMPT_SYNC_TIMEOUT_SEC="300"
 GALILEO_LOCAL_PORT="8000"
 
+# ----------------------------------------------------------------------
+# Tetragon Enterprise
+# ----------------------------------------------------------------------
+
 TETRAGON_EXPORT_DIRECTORY="/var/run/cilium/hubble"
 TETRAGON_EXPORT_FILENAME="tetragon.log"
+
 TETRAGON_ALERT_EXPORT_DIRECTORY="/var/run/cilium/hubble/alert"
+
 TETRAGON_EXPORT_ALLOWLIST='{"event_set":["PROCESS_CONNECT","PROCESS_ACCEPT"]}'
 TETRAGON_EXPORT_DENYLIST='{"namespace":["kube-system"]}'
+
 TETRAGON_CGROUP_RATE="100,1s"
 
+# ----------------------------------------------------------------------
+# Optional behavior
+# ----------------------------------------------------------------------
+
+# Keep generated files under the project so the project remains self-contained.
 RUNTIME_DIR="${KUP_WORKDIR}/runtime"
+
+# Convenience timeout defaults for kubectl/rollout operations.
 ACK_API_TIMEOUT="10s"
 CILIUM_ROLLOUT_TIMEOUT="20m"
 TETRAGON_ROLLOUT_TIMEOUT="15m"

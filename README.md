@@ -359,7 +359,54 @@ kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo \
 ./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
 ```
 
-如需验证官方 baseline，执行 `./scripts/switch_prompt.sh baseline`；这会清空 custom 内容并回到镜像内置文本。再次运行 `./kup --galileo-only`（或完整的 `./kup`）会通过同一上游脚本恢复私有配置指定的 profile 和 baseline variant，默认重新热加载 Qwen baseline，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；完整 Experiment 步骤以 [上游项目 README](https://github.com/highopes/galileo-demo) 为准。
+如需验证官方 baseline，执行 `./scripts/switch_prompt.sh baseline`；这会清空 custom 内容并回到镜像内置文本。再次运行 `./kup --galileo-only`（或完整的 `./kup`）会通过同一上游脚本恢复私有配置指定的 profile 和 baseline variant，默认重新热加载 Qwen baseline，防止下一场演示沿用上次状态。`kup` 和 prompt 切换脚本都不会创建或修改 Splunk AO Evaluator/Dataset；Experiment 统一使用下一节的仓库入口，不直接运行镜像内的 `experiment.py`。
+
+## Splunk AO Model Economics Experiment
+
+`./scripts/galileo-experiment` 在当前唯一 Ready 的 Banking Pod 内执行镜像已有的真实 Multi-Agent workflow。它固定复用 `Banking CN Model Economics` Dataset；首次运行时创建并验证 6 行 Ground Truth，后续运行只复用，绝不覆盖或删除。Evaluator 对象继续由 Splunk AO GUI 管理，脚本不创建、修改或删除它们。
+
+推荐先使用 improved prompt 运行第一个 application model：
+
+```bash
+# model 1
+vim kup.conf
+# GALILEO_APP_MODEL_NAME="qwen3.7-flash"
+# GALILEO_SUPERVISOR_PROMPT_PROFILE="improved"
+
+./kup --galileo-only
+./scripts/galileo-experiment
+```
+
+然后只切换 application model，保持其他变量不变：
+
+```bash
+# model 2
+vim kup.conf
+# GALILEO_APP_MODEL_NAME="qwen3.8-max"
+
+./kup --galileo-only
+./scripts/galileo-experiment
+```
+
+脚本从运行中 Pod 读取真实 `APP_MODEL_NAME` 并写入 Experiment 名称；如果 Pod 与 `kup.conf` 的 model、Project、Agent Stream 或 Console 配置不同，会停止并要求先完成 `./kup --galileo-only`。Prompt 是例外：`switch_prompt.sh` 支持随时热切换，因此脚本只信任并展示当前 Pod resolver 返回的 profile，不要求它与 `kup.conf` 一致，也不会自动切换 prompt。
+
+Evaluator 也是 Experiment 级配置，不要求提前在 Agent Stream 中激活。Demo 1 的 Stream 继续保留原来的 4 个 Evaluator；Demo 2 脚本只从 `GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS` 选择 `Ground Truth Adherence - Qwen`，通过 SDK 的 Scorer 列表动态解析为稳定 ID 并绑定到本次 Experiment，不改变 Demo 1 的 Stream 配置，也不重复运行另外 4 个 Evaluator。若 Ground Truth Evaluator 尚未配置或不存在，脚本给出 warning，但仍生成业务输出和 Trace。脚本不会在本地安装 Python 依赖。
+
+随后在 Splunk AO GUI 中进入 `Experiments`，比较两次运行的 Ground Truth / Generated Output、Evaluators、Tokens、Cost、Latency，以及各自的 Trace/Span：
+
+```text
+Same Agent
+Same Prompt
+Same Dataset
+Same RAG
+Same Tools
+Same Evaluators
+Only the application model changes
+```
+
+Experiment 的 Trace 上传完成后，脚本会先确认 6 条根 Trace 的原生子 Span 已稳定落库，且每条至少有一个带真实 provider token usage 的成功 LLM Span；明确记录为 `Error: Request timed out.` 的失败尝试会保留，但不会被误判为成功调用缺少 Token。随后脚本才完成根记录并从后端读回验证：Dataset input、Ground Truth、generated output、子 Span、LLM model 和成功 LLM Span 的 input/output/total token usage 都必须完整。每条根 Trace 的 Cost、Input/Output/Total Tokens、Latency 也必须已有数值，不能只凭子 Span 有 token 就报告成功。各阶段最多等待 180 秒，缺少任一项明确返回非零。此验收不等待 Judge 分数；Ground Truth Eval 的 pending/failed 项可稍后在 GUI 中 Compute/Recompute。Ctrl-C 不会删除 Dataset 或 Experiment。
+
+Instrumentation 使用 `SplunkAOCallback`，全部子 Span 通过 SDK 原生 OTLP 上传，Cost/Tokens 由平台计算。当前 legacy hosted Galileo（`app.galileo.ai`）的 OTLP 接收路径未保留 Dataset 字段，因此入口在每行 Agent 执行前，先通过官方 SDK 创建只含 Dataset input/Ground Truth 的根记录，使用与该行 OTLP 相同的 Trace ID，子 Span 列表为空。随后 Callback 原样上传子 Span；脚本确认原生 Span 和 token usage 稳定后，再通过官方 SDK 完成同一个根记录的 output、status 和实测 duration。不会创建第二条业务 Trace、重复上传子 Span或手工填写 Cost/Tokens。此适配只作用于 Experiment 进程，不修改镜像、Agent 或 Demo 1 Stream。为了避免 Judge 在 generated output 尚未写入时提前计算，现有 Ground Truth scorer 会在 6 条根记录的数据与标准指标验收完成后才绑定到 Experiment；平台可以异步计算，脚本不额外提交 Recompute，也不等待 Judge 结果。应用模型 timeout 最多尝试三次，最终失败则明确返回非零。
 
 ## Destroy
 

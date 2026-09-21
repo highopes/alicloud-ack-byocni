@@ -1,0 +1,955 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_FILE="${KUP_CONFIG:-${ROOT_DIR}/kup.conf}"
+DEPLOYMENT_NAME="splunk-ao-banking-qwen"
+CONTAINER_NAME="banking-chatbot"
+APP_LABEL="app.kubernetes.io/name=splunk-ao-banking-qwen"
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+usage() {
+  printf 'usage: %s\n' "$0"
+}
+
+case "${1:-}" in
+  "") ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    die "unknown argument: $1"
+    ;;
+esac
+[[ "$#" -le 1 ]] || die "too many arguments"
+
+need kubectl
+need python3
+
+[[ -f "${CONFIG_FILE}" ]] \
+  || die "private config not found: ${CONFIG_FILE}; copy kup.conf.example to kup.conf first"
+chmod 600 "${CONFIG_FILE}"
+
+set -a
+# shellcheck disable=SC1090
+source "${CONFIG_FILE}"
+set +a
+
+WORKDIR="${KUP_WORKDIR:-${ROOT_DIR}}"
+KUBECONFIG_FILE="${KUBECONFIG_FILE:-${WORKDIR}/kubeconfig}"
+ACK_CONTEXT="${ACK_CONTEXT:-ack-byocni-demo}"
+
+require_config() {
+  local name="$1"
+  local value="${!name:-}"
+  [[ -n "${value}" ]] || die "required setting is empty: ${name}"
+  case "${value}" in
+    ReplaceMe|REPLACE_ME|replace-me) die "replace placeholder value for ${name} in ${CONFIG_FILE}" ;;
+  esac
+}
+
+for setting_name in \
+  KUBECONFIG_FILE ACK_CONTEXT GALILEO_NAMESPACE \
+  GALILEO_SPLUNK_AO_API_KEY GALILEO_SPLUNK_AO_PROJECT \
+  GALILEO_SPLUNK_AO_AGENT_STREAM GALILEO_SPLUNK_AO_CONSOLE_URL \
+  GALILEO_APP_MODEL_NAME GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS \
+  GALILEO_SUPERVISOR_PROMPT_PROFILE; do
+  require_config "${setting_name}"
+done
+
+[[ -f "${KUBECONFIG_FILE}" ]] || die "kubeconfig not found: ${KUBECONFIG_FILE}"
+
+kctl=(kubectl --kubeconfig "${KUBECONFIG_FILE}" --context "${ACK_CONTEXT}")
+
+"${kctl[@]}" --request-timeout=10s get --raw=/readyz >/dev/null \
+  || die "ACK context is not reachable: ${ACK_CONTEXT}"
+"${kctl[@]}" get namespace "${GALILEO_NAMESPACE}" -o name >/dev/null \
+  || die "namespace does not exist: ${GALILEO_NAMESPACE}"
+"${kctl[@]}" -n "${GALILEO_NAMESPACE}" get deployment "${DEPLOYMENT_NAME}" -o name >/dev/null \
+  || die "deployment does not exist: ${GALILEO_NAMESPACE}/${DEPLOYMENT_NAME}"
+
+select_ready_pod() {
+  "${kctl[@]}" -n "${GALILEO_NAMESPACE}" get pod -l "${APP_LABEL}" -o json | python3 -c '
+import json
+import sys
+
+ready = []
+for pod in json.load(sys.stdin).get("items", []):
+    metadata = pod.get("metadata", {})
+    if metadata.get("deletionTimestamp"):
+        continue
+    conditions = pod.get("status", {}).get("conditions", [])
+    if any(item.get("type") == "Ready" and item.get("status") == "True" for item in conditions):
+        ready.append(metadata.get("name", ""))
+
+if len(ready) != 1:
+    print(
+        f"expected exactly one Ready, non-deleting application Pod; found {len(ready)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(ready[0])
+'
+}
+
+if ! APP_POD="$(select_ready_pod)"; then
+  die "unable to select a unique Ready Pod for ${GALILEO_NAMESPACE}/${DEPLOYMENT_NAME}"
+fi
+
+emit_runtime_preflight() {
+  cat <<'PY'
+import importlib.metadata
+import importlib.util
+import inspect
+import json
+import os
+import sys
+import warnings
+
+warnings.filterwarnings("ignore")
+warnings.showwarning = lambda *args, **kwargs: None
+
+from splunk_ao.datasets import create_dataset, get_dataset
+from splunk_ao.deployment import DeploymentMode, StandaloneConfig, resolve_deployment
+from splunk_ao.experiments import run_experiment
+from splunk_ao.scorers import Scorers
+from splunk_ao.utils.metrics import create_metric_configs
+from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt
+
+
+def require_env(name: str, *, secret: bool = False) -> str:
+    value = os.getenv(name, "").strip()
+    if not value or value == "ReplaceMe":
+        raise RuntimeError(f"required Pod setting is empty: {name}")
+    if not secret and (not value.isprintable() or "\t" in value):
+        raise RuntimeError(f"Pod setting contains unsupported control characters: {name}")
+    return value
+
+
+try:
+    version = importlib.metadata.version("splunk-ao")
+    if version != "0.4.0":
+        raise RuntimeError(f"expected splunk-ao==0.4.0 in the application image, found {version}")
+
+    required_parameters = {
+        get_dataset: {"name", "project_name"},
+        create_dataset: {"name", "content", "project_name"},
+        run_experiment: {"experiment_name", "project", "dataset", "function", "metrics"},
+        Scorers.list: {"self", "name", "types"},
+        create_metric_configs: {"project_id", "run_id", "metrics"},
+    }
+    for function, expected in required_parameters.items():
+        actual = set(inspect.signature(function).parameters)
+        if not expected.issubset(actual):
+            raise RuntimeError(f"unsupported splunk-ao callable signature: {function.__name__}")
+
+    for module in (
+        "splunk_ao.handlers.langchain",
+        "src.splunk_ao_langgraph_fsi_agent.agents.supervisor_agent",
+    ):
+        if importlib.util.find_spec(module) is None:
+            raise RuntimeError(f"required image module is missing: {module}")
+
+    mode = resolve_deployment()
+    if mode != DeploymentMode.STANDALONE:
+        raise RuntimeError(f"expected standalone Splunk AO deployment, found {mode}")
+
+    require_env("SPLUNK_AO_API_KEY", secret=True)
+    require_env("APP_MODEL_API_KEY", secret=True)
+    require_env("PINECONE_API_KEY", secret=True)
+
+    console = require_env("SPLUNK_AO_CONSOLE_URL").rstrip("/")
+    backend = StandaloneConfig.from_env().otlp_endpoint.removesuffix("/otel/v1/traces").rstrip("/")
+    resolve_supervisor_prompt()
+
+    result = {
+        "sdk_version": version,
+        "project": require_env("SPLUNK_AO_PROJECT"),
+        "agent_stream": require_env("SPLUNK_AO_AGENT_STREAM"),
+        "console": console,
+        "api_backend": backend,
+        "model": require_env("APP_MODEL_NAME"),
+    }
+    print(json.dumps(result, ensure_ascii=False))
+except Exception as exc:
+    print(f"Pod runtime preflight failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PY
+}
+
+if ! RUNTIME_JSON="$(emit_runtime_preflight | \
+  "${kctl[@]}" -n "${GALILEO_NAMESPACE}" exec -i "${APP_POD}" -c "${CONTAINER_NAME}" -- \
+    env PYTHONWARNINGS=ignore SPLUNK_AO_LOG_LEVEL=ERROR python -W ignore -u -)"; then
+  die "application Pod runtime preflight failed"
+fi
+
+runtime_field() {
+  local field="$1"
+  python3 -c 'import json,sys; print(json.loads(sys.stdin.read())[sys.argv[1]])' \
+    "${field}" <<<"${RUNTIME_JSON}"
+}
+
+normalize_url() {
+  python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+value = sys.stdin.read().strip()
+parsed = urlsplit(value)
+if parsed.scheme.lower() != "https" or not parsed.netloc or parsed.username or parsed.password:
+    raise SystemExit("Splunk AO URL must be an HTTPS origin without embedded credentials")
+if parsed.query or parsed.fragment:
+    raise SystemExit("Splunk AO URL must not contain a query or fragment")
+path = parsed.path.rstrip("/")
+print(urlunsplit(("https", parsed.netloc.lower(), path, "", "")))
+'
+}
+
+canonical_csv() {
+  python3 -c '
+import sys
+
+items = [item.strip() for item in sys.stdin.read().split(",") if item.strip()]
+print(",".join(items))
+'
+}
+
+RUNTIME_PROJECT="$(runtime_field project)"
+RUNTIME_AGENT_STREAM="$(runtime_field agent_stream)"
+RUNTIME_CONSOLE="$(runtime_field console)"
+RUNTIME_MODEL="$(runtime_field model)"
+[[ "${RUNTIME_PROJECT}" == "${GALILEO_SPLUNK_AO_PROJECT}" ]] \
+  || die "Pod project differs from kup.conf; run ./kup --galileo-only before the Experiment"
+[[ "${RUNTIME_AGENT_STREAM}" == "${GALILEO_SPLUNK_AO_AGENT_STREAM}" ]] \
+  || die "Pod Agent Stream differs from kup.conf; run ./kup --galileo-only before the Experiment"
+[[ "${RUNTIME_MODEL}" == "${GALILEO_APP_MODEL_NAME}" ]] \
+  || die "Pod application model (${RUNTIME_MODEL}) differs from kup.conf (${GALILEO_APP_MODEL_NAME}); run ./kup --galileo-only first"
+
+LOCAL_CONSOLE="$(normalize_url <<<"${GALILEO_SPLUNK_AO_CONSOLE_URL}")" \
+  || die "invalid GALILEO_SPLUNK_AO_CONSOLE_URL in ${CONFIG_FILE}"
+POD_CONSOLE="$(normalize_url <<<"${RUNTIME_CONSOLE}")" \
+  || die "invalid SPLUNK_AO_CONSOLE_URL in the application Pod"
+[[ "${POD_CONSOLE}" == "${LOCAL_CONSOLE}" ]] \
+  || die "Pod Splunk AO console differs from kup.conf; run ./kup --galileo-only before the Experiment"
+
+LOCAL_EVALUATORS="$(canonical_csv <<<"${GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS}")"
+[[ -n "${LOCAL_EVALUATORS}" ]] || die "no Experiment evaluators are configured"
+
+emit_experiment_program() {
+  cat <<'PY'
+from __future__ import annotations
+
+import os
+import sys
+import time
+import uuid
+import warnings
+from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+warnings.filterwarnings("ignore")
+warnings.showwarning = lambda *args, **kwargs: None
+
+from splunk_ao.deployment import DeploymentMode, StandaloneConfig, resolve_deployment
+
+
+DATASET_NAME = "Banking CN Model Economics"
+EXPERIMENT_GROUP = "Banking CN Model Economics"
+DATASET_CONTENT = [
+    {
+        "input": "Orbit信用卡提供哪些返现奖励？",
+        "output": "Orbit Basic 信用卡不提供任何返现、积分或里程奖励，也没有奖励计划。",
+    },
+    {
+        "input": "我的信用评分是多少？",
+        "output": "你的信用评分是 550。",
+    },
+    {
+        "input": "Orbit信用卡的余额转账年利率是多少？",
+        "output": "Orbit Basic 信用卡的余额转账年利率为 0%，优惠期为 12 个月。当前知识库没有说明 12 个月之后的余额转账 APR。",
+    },
+    {
+        "input": "我符合哪些信用卡的申请条件？",
+        "output": "仅根据你的 550 信用评分，你满足 Orbit Basic 信用卡的信用评分要求（超过 500），但不满足 Celestial Rewards 信用卡的信用评分要求（超过 600）。完整申请资格还取决于年龄、美国地址和 SSN 等其他要求。",
+    },
+    {
+        "input": "我的信用评分能用来做什么？",
+        "output": "在当前银行场景中，信用评分可用于判断信用卡申请是否满足信用要求。你的信用评分为 550，满足 Orbit Basic 的信用评分要求，但不满足 Celestial Rewards 的信用评分要求。",
+    },
+    {
+        "input": "请推荐一本好书给我。",
+        "output": "I cannot answer that question.",
+    },
+]
+
+
+def require_env(name: str, *, secret: bool = False) -> str:
+    value = os.getenv(name, "").strip()
+    if not value or value == "ReplaceMe":
+        raise RuntimeError(f"required Pod setting is empty: {name}")
+    if not secret and not value.isprintable():
+        raise RuntimeError(f"Pod setting contains unsupported control characters: {name}")
+    return value
+
+
+def normalize_url(value: str) -> str:
+    parsed = urlsplit(value.strip())
+    if parsed.scheme.lower() != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise RuntimeError("Splunk AO URL must be an HTTPS origin without embedded credentials")
+    if parsed.query or parsed.fragment:
+        raise RuntimeError("Splunk AO URL must not contain a query or fragment")
+    path = parsed.path.rstrip("/")
+    return urlunsplit(("https", parsed.netloc.lower(), path, "", ""))
+
+
+def configure_backend() -> tuple[str, str]:
+    mode = resolve_deployment()
+    if mode != DeploymentMode.STANDALONE:
+        raise RuntimeError(f"expected standalone Splunk AO deployment, found {mode}")
+
+    require_env("SPLUNK_AO_API_KEY", secret=True)
+    console = normalize_url(require_env("SPLUNK_AO_CONSOLE_URL"))
+    os.environ["SPLUNK_AO_CONSOLE_URL"] = console
+
+    standalone = StandaloneConfig.from_env()
+    backend = normalize_url(standalone.otlp_endpoint.removesuffix("/otel/v1/traces"))
+
+    legacy_console = os.getenv("GALILEO_CONSOLE_URL", "").strip()
+    legacy_backend = os.getenv("GALILEO_API_URL", "").strip()
+    legacy_key = os.getenv("GALILEO_API_KEY", "")
+    if legacy_console and normalize_url(legacy_console) != console:
+        raise RuntimeError("conflicting GALILEO_CONSOLE_URL and SPLUNK_AO_CONSOLE_URL are set")
+    if legacy_backend and normalize_url(legacy_backend) != backend:
+        raise RuntimeError("conflicting GALILEO_API_URL and SDK-derived Splunk AO API backend are set")
+    if legacy_key and legacy_key != os.environ["SPLUNK_AO_API_KEY"]:
+        raise RuntimeError("conflicting GALILEO_API_KEY and SPLUNK_AO_API_KEY are set")
+
+    # splunk-ao 0.4.0 bridges this supported variable to galileo-core. Setting
+    # the SDK-derived value explicitly keeps CRUD and trace ingest on the same
+    # standalone backend for both console.* and legacy app.* deployments.
+    os.environ["SPLUNK_AO_API_URL"] = backend
+    return console, backend
+
+
+CONSOLE_URL, API_BACKEND = configure_backend()
+LEGACY_HOSTED_GALILEO = urlsplit(CONSOLE_URL).hostname == "app.galileo.ai"
+
+from langchain.schema.runnable.config import RunnableConfig  # noqa: E402
+from langchain_core.messages import HumanMessage  # noqa: E402
+from splunk_ao import splunk_ao_context  # noqa: E402
+from splunk_ao.config import SplunkAOConfig  # noqa: E402
+from splunk_ao.datasets import create_dataset, get_dataset  # noqa: E402
+from splunk_ao.experiments import run_experiment  # noqa: E402
+from splunk_ao.handlers.langchain import SplunkAOCallback  # noqa: E402
+from splunk_ao.resources.api.trace import (  # noqa: E402
+    log_traces_projects_project_id_traces_post as ingest_roots_api,
+    update_trace_projects_project_id_traces_trace_id_patch as update_root_api,
+    query_spans_projects_project_id_spans_search_post as query_spans_api,
+    query_traces_projects_project_id_traces_search_post as query_traces_api,
+)
+from splunk_ao.resources.models.log_records_query_request import LogRecordsQueryRequest  # noqa: E402
+from splunk_ao.resources.models.log_traces_ingest_request import LogTracesIngestRequest  # noqa: E402
+from splunk_ao.resources.models.log_traces_ingest_response import LogTracesIngestResponse  # noqa: E402
+from splunk_ao.resources.models.log_trace_update_request import LogTraceUpdateRequest  # noqa: E402
+from splunk_ao.resources.models.log_trace_update_response import LogTraceUpdateResponse  # noqa: E402
+from splunk_ao.scorers import Scorers  # noqa: E402
+from splunk_ao.utils.metrics import create_metric_configs  # noqa: E402
+
+from src.splunk_ao_langgraph_fsi_agent.agents.supervisor_agent import create_supervisor_agent  # noqa: E402
+from src.splunk_ao_langgraph_fsi_agent.config import get_settings  # noqa: E402
+from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt  # noqa: E402
+
+
+def validate_dataset(dataset: Any) -> None:
+    content = dataset.get_content(limit=100)
+    rows = [] if content is None else list(content.rows or [])
+    if len(rows) != len(DATASET_CONTENT):
+        raise RuntimeError(
+            f"existing Dataset {DATASET_NAME!r} has {len(rows)} rows, expected {len(DATASET_CONTENT)}; "
+            "it was not modified"
+        )
+
+    actual: dict[str, str] = {}
+    for row in rows:
+        values = row.values_dict.to_dict()
+        input_value = values.get("input")
+        output_value = values.get("output")
+        if output_value is None:
+            output_value = values.get("ground_truth")
+        if not isinstance(input_value, str) or not isinstance(output_value, str):
+            raise RuntimeError(
+                f"existing Dataset {DATASET_NAME!r} does not use the required input/output schema; "
+                "it was not modified"
+            )
+        if input_value in actual:
+            raise RuntimeError(f"existing Dataset {DATASET_NAME!r} contains duplicate inputs; it was not modified")
+        actual[input_value] = output_value
+
+    expected = {row["input"]: row["output"] for row in DATASET_CONTENT}
+    if actual != expected:
+        raise RuntimeError(
+            f"existing Dataset {DATASET_NAME!r} differs from the reviewed six-row Ground Truth fixture; "
+            "it was not modified"
+        )
+
+
+def ensure_dataset(project: str) -> tuple[Any, str]:
+    dataset = get_dataset(name=DATASET_NAME, project_name=project)
+    if dataset is not None:
+        validate_dataset(dataset)
+        return dataset, "existing, reusing 6 rows"
+
+    create_dataset(name=DATASET_NAME, content=DATASET_CONTENT, project_name=project)
+    for _ in range(5):
+        dataset = get_dataset(name=DATASET_NAME, project_name=project)
+        if dataset is not None:
+            validate_dataset(dataset)
+            return dataset, "created, verified 6 rows"
+        time.sleep(2)
+    raise RuntimeError(f"Dataset {DATASET_NAME!r} was created but could not be read back")
+
+
+def resolve_ground_truth_evaluator(configured_names: list[str]) -> tuple[list[str], list[str]]:
+    ground_truth_name = "Ground Truth Adherence - Qwen"
+    if ground_truth_name not in configured_names:
+        print(
+            "WARNING: Dataset contains Ground Truth but Ground Truth Adherence - Qwen is not configured; "
+            "the Experiment will run without an Evaluator.",
+            file=sys.stderr,
+        )
+        return [], []
+
+    scorers = Scorers().list()
+    for scorer in scorers:
+        name = getattr(scorer, "name", None)
+        label = getattr(scorer, "label", None)
+        candidates = [value for value in (label, name) if isinstance(value, str)]
+        if any(value.casefold() == ground_truth_name.casefold() for value in candidates):
+            display_name = label if isinstance(label, str) and label else name
+            print(
+                f"Ground Truth evaluator: existing, selecting {display_name!r} for this Experiment "
+                "without changing the Agent Stream."
+            )
+            return [str(scorer.id)], [str(display_name)]
+
+    print(
+        f"WARNING: Evaluator {ground_truth_name!r} does not exist in Splunk AO; "
+        "the Experiment will run without an Evaluator.",
+        file=sys.stderr,
+    )
+    return [], []
+
+
+def seed_dataset_root(logger: Any) -> dict[str, Any]:
+    """Persist Dataset fields before the same Trace receives native OTLP spans.
+
+    In 0.4.0 the proprietary Trace UUID differs from the OTLP trace ID.
+    The legacy receiver normalizes the latter to UUIDv4. Read that identity;
+    never create a second business Trace or upload child spans through this API.
+    """
+    from dataclasses import replace
+    root = logger.current_parent()
+    while root is not None and getattr(root, "_parent", None) is not None:
+        root = root._parent
+    if root is None or not root.dataset_input or not root.dataset_output:
+        raise RuntimeError("Dataset input/Ground Truth missing from the SDK Experiment context")
+    identity = logger._otel_ids.get(root.id)
+    if identity is None:
+        raise RuntimeError("SDK OTLP Trace identity is unavailable")
+    trace_id = str(uuid.UUID(int=identity.span_context.trace_id, version=4))
+    result = ingest_roots_api.sync(
+        project_id=str(logger.project_id),
+        client=SplunkAOConfig.get().api_client,
+        body=LogTracesIngestRequest.from_dict({
+            "experiment_id": str(logger.experiment_id),
+            "reliable": True,
+            "is_complete": False,
+            "traces": [{
+                "id": trace_id, "trace_id": trace_id, "type": "trace",
+                "name": root.name, "input": root.dataset_input,
+                "created_at": root.created_at.isoformat(),
+                "dataset_input": root.dataset_input,
+                "dataset_output": root.dataset_output,
+                "dataset_metadata": dict(root.dataset_metadata),
+                "spans": [],
+            }],
+        }),
+    )
+    if not isinstance(result, LogTracesIngestResponse) or result.records_count != 1:
+        raise RuntimeError("Backend did not acknowledge the Dataset root record")
+    # Keep the root, the wrapper Workflow, and subsequent Callback spans in the
+    # session returned by root ingestion. No span IDs or topology are changed.
+    session_id = str(result.session_id)
+    logger._set_active_session_id(session_id)
+    for step_id, step_identity in list(logger._otel_ids.items()):
+        if step_identity.span_context.trace_id == identity.span_context.trace_id:
+            logger._otel_ids[step_id] = replace(step_identity, session_id=session_id)
+    return {"trace_id": trace_id, "project_id": str(logger.project_id),
+            "experiment_id": str(logger.experiment_id)}
+
+
+def finish_dataset_roots(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        result = update_root_api.sync(
+            project_id=row["project_id"], trace_id=row["trace_id"],
+            client=SplunkAOConfig.get().api_client,
+            body=LogTraceUpdateRequest(
+                trace_id=row["trace_id"], experiment_id=row["experiment_id"],
+                output=row["output"], duration_ns=row["duration_ns"],
+                status_code=200, is_complete=True, reliable=True,
+            ),
+        )
+        if not isinstance(result, LogTraceUpdateResponse):
+            raise RuntimeError(f"Root completion was not acknowledged: {row['trace_id']}")
+
+
+def is_token_bearing_llm_span(span: dict[str, Any]) -> bool:
+    if span.get("type") != "llm" or not span.get("model"):
+        return False
+    metrics = span.get("metrics") or {}
+    input_tokens = metrics.get("num_input_tokens")
+    output_tokens = metrics.get("num_output_tokens")
+    total_tokens = metrics.get("num_total_tokens")
+    return (
+        isinstance(input_tokens, (int, float))
+        and not isinstance(input_tokens, bool)
+        and input_tokens > 0
+        and isinstance(output_tokens, (int, float))
+        and not isinstance(output_tokens, bool)
+        and output_tokens >= 0
+        and isinstance(total_tokens, (int, float))
+        and not isinstance(total_tokens, bool)
+        and total_tokens > 0
+    )
+
+
+def is_timeout_llm_span(span: dict[str, Any]) -> bool:
+    if span.get("type") != "llm":
+        return False
+    output = span.get("output")
+    if isinstance(output, dict):
+        output = output.get("content")
+    error_text = " ".join(
+        str(value)
+        for value in (output, span.get("error_message"))
+        if value is not None
+    ).casefold()
+    return "error" in error_text and ("timed out" in error_text or "timeout" in error_text)
+
+
+def wait_for_native_spans(rows: list[dict[str, Any]]) -> None:
+    """Wait until native OTLP children and provider token usage are stable.
+
+    Root completion triggers the hosted backend's standard-metric aggregation.
+    Completing it before the final child arrives leaves that root without Token
+    aggregates, and a later root PATCH does not recompute them.
+    """
+    if not rows:
+        raise RuntimeError("no completed Dataset rows are available for trace verification")
+    project_id = rows[0]["project_id"]
+    experiment_id = rows[0]["experiment_id"]
+    expected_ids = {row["trace_id"] for row in rows}
+    deadline = time.monotonic() + 180
+    previous_signature: tuple[tuple[str, tuple[tuple[str, float], ...]], ...] | None = None
+    stable_reads = 0
+    last_issues: list[str] = ["native Spans are not searchable yet"]
+
+    while time.monotonic() < deadline:
+        span_result = query_spans_api.sync(
+            project_id=project_id,
+            client=SplunkAOConfig.get().api_client,
+            body=LogRecordsQueryRequest(experiment_id=experiment_id, limit=1000),
+        )
+        stored_spans: dict[str, list[dict[str, Any]]] = {
+            trace_id: [] for trace_id in expected_ids
+        }
+        for item in (getattr(span_result, "records", None) or []):
+            values = item.to_dict()
+            trace_id = str(values.get("trace_id", ""))
+            if trace_id in stored_spans:
+                stored_spans[trace_id].append(values)
+
+        issues: list[str] = []
+        for trace_id, spans in stored_spans.items():
+            token_spans = [span for span in spans if is_token_bearing_llm_span(span)]
+            if not spans:
+                issues.append(f"Trace {trace_id} has no native child Spans")
+            elif not token_spans:
+                issues.append(f"Trace {trace_id} has no token-bearing successful LLM Span")
+
+        signature = tuple(
+            (
+                trace_id,
+                tuple(
+                    sorted(
+                        (
+                            str(span.get("id", "")),
+                            float((span.get("metrics") or {}).get("num_total_tokens") or 0),
+                        )
+                        for span in spans
+                    )
+                ),
+            )
+            for trace_id, spans in sorted(stored_spans.items())
+        )
+        if not issues and signature == previous_signature:
+            stable_reads += 1
+        else:
+            stable_reads = 0
+        previous_signature = signature
+
+        # Three identical searchable snapshots ensure the last native OTLP batch
+        # has arrived before root completion triggers backend aggregation.
+        if not issues and stable_reads >= 2:
+            span_count = sum(len(items) for items in stored_spans.values())
+            token_span_count = sum(
+                1
+                for items in stored_spans.values()
+                for span in items
+                if is_token_bearing_llm_span(span)
+            )
+            print(
+                f"Native trace ingest stable: {span_count} Spans, "
+                f"{token_span_count} token-bearing LLM Spans across 6/6 roots."
+            )
+            return
+
+        last_issues = issues or ["native Span set has not stabilized"]
+        time.sleep(3)
+
+    raise RuntimeError(
+        "Native trace ingest did not stabilize within 180 seconds: "
+        + "; ".join(dict.fromkeys(last_issues[:6]))
+    )
+
+
+def verify_experiment_telemetry(project_id: str, experiment_id: str) -> None:
+    expected_ground_truth = {row["input"]: row["output"] for row in DATASET_CONTENT}
+    verification_deadline = time.monotonic() + 180
+    last_issues: list[str] = ["Experiment records are not searchable yet"]
+
+    while time.monotonic() < verification_deadline:
+        trace_result = query_traces_api.sync(
+            project_id=project_id,
+            client=SplunkAOConfig.get().api_client,
+            body=LogRecordsQueryRequest(
+                experiment_id=experiment_id,
+                limit=100,
+            ),
+        )
+        span_result = query_spans_api.sync(
+            project_id=project_id,
+            client=SplunkAOConfig.get().api_client,
+            body=LogRecordsQueryRequest(
+                experiment_id=experiment_id,
+                limit=1000,
+            ),
+        )
+        stored_traces = {
+            str(item.id): item.to_dict()
+            for item in (getattr(trace_result, "records", None) or [])
+        }
+        expected_ids = set(stored_traces)
+        stored_spans: dict[str, list[dict[str, Any]]] = {trace_id: [] for trace_id in expected_ids}
+        for item in (getattr(span_result, "records", None) or []):
+            values = item.to_dict()
+            trace_id = str(values.get("trace_id", ""))
+            if trace_id in stored_spans:
+                stored_spans[trace_id].append(values)
+
+        issues: list[str] = []
+        if len(stored_traces) != len(DATASET_CONTENT):
+            issues.append(f"expected 6 root Traces, found {len(stored_traces)}")
+
+        seen_inputs: set[str] = set()
+        for trace_id, root in stored_traces.items():
+            dataset_input = root.get("dataset_input")
+            dataset_output = root.get("dataset_output")
+            generated_output = root.get("output")
+            if not isinstance(dataset_input, str) or dataset_input not in expected_ground_truth:
+                issues.append(f"Trace {trace_id} has an invalid Dataset input")
+            else:
+                seen_inputs.add(dataset_input)
+                if dataset_output != expected_ground_truth[dataset_input]:
+                    issues.append(f"Trace {trace_id} has missing or incorrect Ground Truth")
+            if not isinstance(generated_output, str) or not generated_output.strip():
+                issues.append(f"Trace {trace_id} has no generated output")
+
+            root_metrics = root.get("metrics") or {}
+            for metric in ("cost", "num_input_tokens", "num_output_tokens", "num_total_tokens", "duration_ns"):
+                value = root_metrics.get(metric)
+                if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                    issues.append(f"Trace {trace_id} has no root-level {metric}")
+
+            child_spans = stored_spans.get(trace_id, [])
+            if not child_spans:
+                issues.append(f"Trace {trace_id} has no stored child Spans")
+                continue
+            llm_spans = [span for span in child_spans if span.get("type") == "llm"]
+            if not llm_spans:
+                issues.append(f"Trace {trace_id} has no stored LLM Span")
+                continue
+            token_bearing_count = 0
+            for span in llm_spans:
+                span_name = str(span.get("name") or "unnamed")
+                if not span.get("model"):
+                    issues.append(f"LLM Span {span_name!r} in Trace {trace_id} has no model")
+                if is_timeout_llm_span(span):
+                    continue
+                if is_token_bearing_llm_span(span):
+                    token_bearing_count += 1
+                    continue
+                usage = span.get("metrics") or {}
+                input_tokens = usage.get("num_input_tokens")
+                output_tokens = usage.get("num_output_tokens")
+                total_tokens = usage.get("num_total_tokens")
+                if not isinstance(input_tokens, (int, float)) or input_tokens <= 0:
+                    issues.append(f"LLM Span {span_name!r} in Trace {trace_id} has no input tokens")
+                if not isinstance(output_tokens, (int, float)) or output_tokens < 0:
+                    issues.append(f"LLM Span {span_name!r} in Trace {trace_id} has no output tokens")
+                if not isinstance(total_tokens, (int, float)) or total_tokens <= 0:
+                    issues.append(f"LLM Span {span_name!r} in Trace {trace_id} has no total tokens")
+            if token_bearing_count == 0:
+                issues.append(f"Trace {trace_id} has no token-bearing successful LLM Span")
+
+        if seen_inputs != set(expected_ground_truth):
+            issues.append("the six stored Trace inputs do not match the Dataset")
+
+        if not issues:
+            span_count = sum(len(items) for items in stored_spans.values())
+            llm_span_count = sum(
+                1
+                for items in stored_spans.values()
+                for span in items
+                if is_token_bearing_llm_span(span)
+            )
+            print(
+                f"Trace verification: 6/6 roots, {span_count} Spans, "
+                f"{llm_span_count} token-bearing LLM Spans; Ground Truth, outputs, "
+                "root Cost/Tokens/Latency complete."
+            )
+            break
+
+        last_issues = issues
+        time.sleep(3)
+    else:
+        summary = "; ".join(dict.fromkeys(last_issues[:8]))
+        raise RuntimeError(
+            f"Experiment telemetry did not become complete within 180 seconds: {summary}"
+        )
+
+
+def is_transient_agent_error(exc: Exception) -> bool:
+    error_name = type(exc).__name__.casefold()
+    message = str(exc).casefold()
+    return "timeout" in error_name or "timeout" in message or "timed out" in message
+
+
+def main() -> int:
+    get_settings()
+    project = require_env("SPLUNK_AO_PROJECT")
+    agent_stream = require_env("SPLUNK_AO_AGENT_STREAM")
+    model = require_env("APP_MODEL_NAME")
+    configured_evaluator_names = [
+        item.strip()
+        for item in require_env("SPLUNK_AO_EXPERIMENT_EVALUATORS").split(",")
+        if item.strip()
+    ]
+    if not configured_evaluator_names:
+        raise RuntimeError("no Experiment evaluators are configured")
+    if len(configured_evaluator_names) != len(set(configured_evaluator_names)):
+        raise RuntimeError("duplicate Experiment evaluator names are configured")
+
+    prompt_profile, _ = resolve_supervisor_prompt()
+
+    print("[Galileo Experiment]")
+    print(f"Project: {project}")
+    print(f"Agent Stream: {agent_stream}")
+    print(f"Console: {CONSOLE_URL}")
+    print(f"API backend: {API_BACKEND}")
+    print(f"Application model: {model}")
+    print(f"Prompt profile: {prompt_profile}")
+    print()
+
+    if prompt_profile in {"baseline", "custom"}:
+        print(
+            f"WARNING: Prompt profile {prompt_profile!r} may be a broken/demo baseline; "
+            "Model Economics is normally run with 'improved'.",
+            file=sys.stderr,
+        )
+    evaluator_ids, evaluator_names = resolve_ground_truth_evaluator(configured_evaluator_names)
+
+    dataset, dataset_status = ensure_dataset(project)
+    print(f"Dataset: {DATASET_NAME}")
+    print(f"Dataset status: {dataset_status}")
+    if LEGACY_HOSTED_GALILEO:
+        print("Trace ingest: SDK OTLP spans + Dataset root metadata (same Trace ID)")
+    else:
+        print("Trace ingest: SDK OTLP")
+    print()
+    print("Evaluators:")
+    if evaluator_names:
+        for evaluator in evaluator_names:
+            print(f"  - {evaluator}")
+    else:
+        print("  - none (Ground Truth remains visible in the Dataset)")
+    print()
+
+    supervisor = create_supervisor_agent(prompt_profile)
+    experiment_name = f"Banking CN Economics - {model} - {datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
+    completed_rows: list[dict[str, Any]] = []
+
+    def run_agent(dataset_input: Any) -> str:
+        if isinstance(dataset_input, dict):
+            user_input = dataset_input.get("input") or dataset_input.get("question")
+        else:
+            user_input = dataset_input
+        if not isinstance(user_input, str) or not user_input.strip():
+            raise ValueError("Dataset row must contain a non-empty input/question string")
+
+        logger = splunk_ao_context.get_logger_instance()
+        root_record = seed_dataset_root(logger) if LEGACY_HOSTED_GALILEO else {}
+        started_ns = time.perf_counter_ns()
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            thread_id = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"{experiment_name}\n{user_input}\nattempt={attempt}")
+            )
+            callback = SplunkAOCallback(
+                splunk_ao_logger=splunk_ao_context.get_logger_instance(),
+                start_new_trace=False,
+                flush_on_chain_end=False,
+            )
+            try:
+                response = supervisor.invoke(
+                    input={"messages": [HumanMessage(content=user_input)]},
+                    config=RunnableConfig(callbacks=[callback], configurable={"thread_id": thread_id}),
+                )
+                output = str(response["messages"][-1].content)
+                if not output.strip():
+                    raise RuntimeError("banking agent returned an empty response")
+                root_record.update(output=output, duration_ns=time.perf_counter_ns() - started_ns)
+                completed_rows.append(root_record)
+                print(f"Scenario completed: {len(completed_rows)}/{len(DATASET_CONTENT)}", flush=True)
+                return output
+            except Exception as exc:
+                if attempt == max_attempts or not is_transient_agent_error(exc):
+                    raise
+                print(
+                    f"WARNING: application-model timeout; retrying scenario "
+                    f"({attempt + 1}/{max_attempts}).",
+                    file=sys.stderr,
+                )
+                time.sleep(2 * attempt)
+
+        raise RuntimeError("banking agent retry loop ended without a response")
+
+    print("Running 6 banking scenarios...")
+    print()
+    print("Experiment:")
+    print(f"  {experiment_name}")
+    print()
+    sys.stdout.flush()
+
+    flush_errors: list[Exception] = []
+    response = run_experiment(
+        experiment_name,
+        project=project,
+        dataset=dataset,
+        function=run_agent,
+        # Dataset roots are pre-seeded before generated output exists. Bind the
+        # scorer only after telemetry completion so the Judge cannot score an
+        # incomplete root with output=null.
+        metrics=None,
+        experiment_group=EXPERIMENT_GROUP,
+        on_error=flush_errors.append,
+    )
+    experiment_obj = response["experiment"]
+    link = response.get("link") or "unavailable"
+
+    if flush_errors or len(completed_rows) != len(DATASET_CONTENT):
+        print(
+            "ERROR: Experiment exists, but upload or root Metrics verification failed. "
+            f"URL: {link}",
+            file=sys.stderr,
+        )
+        for error in flush_errors:
+            print(redact(f"{type(error).__name__}: {error}"), file=sys.stderr)
+        return 2
+
+    if LEGACY_HOSTED_GALILEO:
+        wait_for_native_spans(completed_rows)
+        finish_dataset_roots(completed_rows)
+    print(f"Verifying root Metrics and Dataset fields: {link}")
+    verify_experiment_telemetry(str(experiment_obj.project_id), str(experiment_obj.id))
+    if evaluator_ids:
+        create_metric_configs(
+            str(experiment_obj.project_id),
+            str(experiment_obj.id),
+            evaluator_ids,
+        )
+        print("Ground Truth evaluator bound after telemetry completion; scoring is asynchronous.")
+    print("Experiment submitted successfully.")
+    print(f"ID: {experiment_obj.id}")
+    print(f"Name: {experiment_obj.name}")
+    print(f"URL: {link}")
+    print(f"Application model: {model}")
+    print(f"Dataset: {DATASET_NAME}")
+    print("Evaluators: " + (", ".join(evaluator_names) if evaluator_names else "none"))
+    print(
+        "Evaluation status: manual/asynchronous. Select the six rows in the GUI and run "
+        "Compute Metrics (or Recompute for failed rows); this does not rerun the Agent."
+    )
+    return 0
+
+
+def redact(message: str) -> str:
+    for name in (
+        "SPLUNK_AO_API_KEY",
+        "APP_MODEL_API_KEY",
+        "PINECONE_API_KEY",
+        "OPENAI_API_KEY",
+        "GALILEO_API_KEY",
+    ):
+        value = os.getenv(name, "")
+        if value:
+            message = message.replace(value, "<redacted>")
+    return message
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print(
+            "Interrupted. Any Dataset or Experiment already created was preserved; nothing was deleted.",
+            file=sys.stderr,
+        )
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"ERROR: {type(exc).__name__}: {redact(str(exc))}", file=sys.stderr)
+        raise SystemExit(2)
+PY
+}
+
+trap 'printf "Interrupted. Any Dataset or Experiment already created was preserved; nothing was deleted.\n" >&2; exit 130' INT TERM
+
+emit_experiment_program | \
+  "${kctl[@]}" -n "${GALILEO_NAMESPACE}" exec -i "${APP_POD}" -c "${CONTAINER_NAME}" -- \
+    env PYTHONWARNINGS=ignore SPLUNK_AO_LOG_LEVEL=ERROR \
+      "SPLUNK_AO_EXPERIMENT_EVALUATORS=${LOCAL_EVALUATORS}" python -W ignore -u -
